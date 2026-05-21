@@ -2921,7 +2921,7 @@ class SeizureAnnotationGUI(QMainWindow):
             self._commit_referential_data(
                 ref_base,
                 list(self.channel_names_all),
-                default_invert=False,
+                default_invert=True,
             )
             spike_sec = None
             if option is not None:
@@ -3086,10 +3086,10 @@ class SeizureAnnotationGUI(QMainWindow):
         # Banana montage only (referential cached for polarity toggle).
         self._ref_eeg_data_base = self.eeg_data.astype(np.float32)
         self._ref_channel_names = list(self.channel_names_all)
-        self.polarity_inverted = False
+        self.polarity_inverted = True
         if hasattr(self, "btn_invert_polarity"):
             self.btn_invert_polarity.blockSignals(True)
-            self.btn_invert_polarity.setChecked(False)
+            self.btn_invert_polarity.setChecked(True)
             self.btn_invert_polarity.blockSignals(False)
         self._rebuild_montage_caches()
         self._apply_active_montage()
