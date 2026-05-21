@@ -1,0 +1,30 @@
+# Secrets and local credentials — never commit
+.env
+.env.local
+.env.*.local
+*.env
+launch_gui.local.ps1
+**/agu_ieeglogin.bin
+**/*password*.bin
+**/*login*.bin
+
+# Review outputs (local clinician data)
+sz-gui/seizure_gui/annotations/
+**/annotations/**/*.json
+
+# Large generated data (optional local cache)
+clip_edfs/
+*.edf
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
