@@ -174,8 +174,7 @@ def fetch_ieeg_window_uv(
             clip_start += dur
 
     raw = np.concatenate(raw_chunks, axis=0)
-    # Volts → µV, polarity flip aligned with lab EDF_handler workflow
-    data_uv = raw * vcf * 1e6 * -1.0
+    data_uv = raw * vcf * 1e6
     return data_uv.astype(np.float32), selected, fs
 
 

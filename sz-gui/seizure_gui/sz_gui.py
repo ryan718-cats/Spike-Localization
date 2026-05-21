@@ -1778,10 +1778,9 @@ class SeizureAnnotationGUI(QMainWindow):
 
         # ── montage ───────────────────────────────────────────────────────────
         self.montage: str = "referential"             # referential | bipolar | banana | ap_bipolar
-        self._ref_eeg_data_base: np.ndarray | None = None  # referential µV, no polarity sign
-        self._ref_eeg_data: np.ndarray | None = None  # referential with polarity sign applied
-        self._ref_channel_names: list[str] = []       # backup of referential names
-        self.polarity_inverted: bool = False          # unchecked = lab flip applied at draw time
+        self._ref_eeg_data_base: np.ndarray | None = None  # referential µV (as loaded)
+        self._ref_eeg_data: np.ndarray | None = None
+        self._ref_channel_names: list[str] = []
         self.eeg_data_bipolar: np.ndarray | None = None
         self.channel_names_bipolar: list[str] = []
         self.eeg_data_banana: np.ndarray | None = None
@@ -1887,18 +1886,17 @@ class SeizureAnnotationGUI(QMainWindow):
 
         row1.addSpacing(10)
 
-        montage_lbl = QLabel("Montage: Banana")
-        montage_lbl.setStyleSheet("font-weight: bold;")
-        row1.addWidget(montage_lbl)
-
-        self.btn_invert_polarity = QPushButton("Invert signal")
-        self.btn_invert_polarity.setCheckable(True)
-        self.btn_invert_polarity.setChecked(False)
-        self.btn_invert_polarity.setToolTip(
-            "Toggle EEG polarity (off by default; traces use lab convention automatically)."
+        row1.addWidget(QLabel("Montage:"))
+        self.montage_combo = QComboBox()
+        self.montage_combo.addItem("As recorded", "referential")
+        self.montage_combo.addItem("Banana", "banana")
+        self.montage_combo.setCurrentIndex(1)
+        self.montage_combo.setToolTip(
+            "As recorded: each scalp channel as stored (referential). "
+            "Banana: double-banana chain pairs."
         )
-        self.btn_invert_polarity.toggled.connect(self._on_invert_polarity_toggled)
-        row1.addWidget(self.btn_invert_polarity)
+        self.montage_combo.currentIndexChanged.connect(self._on_montage_combo_changed)
+        row1.addWidget(self.montage_combo)
 
         row1.addSpacing(10)
 
@@ -2872,11 +2870,7 @@ class SeizureAnnotationGUI(QMainWindow):
                 vcf = float(getattr(first_details, "voltage_conversion_factor", 1.0))
                 raw_uv = raw_data * vcf * IEEG_SCALE
                 ref_base = self._preprocess(raw_uv, self.fs).astype(np.float32)
-                self._commit_referential_data(
-                    ref_base,
-                    list(self.channel_names_all),
-                    default_invert=False,
-                )
+                self._commit_referential_data(ref_base, list(self.channel_names_all))
 
         except Exception as exc:
             QMessageBox.critical(self, "iEEG Load Error", str(exc))
@@ -2918,13 +2912,7 @@ class SeizureAnnotationGUI(QMainWindow):
 
             data_uv = data_v * IEEG_SCALE
             ref_base = self._preprocess(data_uv, self.fs).astype(np.float32)
-            # Clip EDFs are exported with lab flip (* -1); undo to iEEG.org raw, then draw applies flip.
-            ref_base = (-ref_base).astype(np.float32)
-            self._commit_referential_data(
-                ref_base,
-                list(self.channel_names_all),
-                default_invert=False,
-            )
+            self._commit_referential_data(ref_base, list(self.channel_names_all))
             spike_sec = None
             if option is not None:
                 spike_sec = option.get("spike_time_sec")
@@ -3085,14 +3073,8 @@ class SeizureAnnotationGUI(QMainWindow):
             self.status_bar.showMessage("Load failed.")
             return
 
-        # Banana montage only (referential cached for polarity toggle).
         self._ref_eeg_data_base = self.eeg_data.astype(np.float32)
         self._ref_channel_names = list(self.channel_names_all)
-        self.polarity_inverted = False
-        if hasattr(self, "btn_invert_polarity"):
-            self.btn_invert_polarity.blockSignals(True)
-            self.btn_invert_polarity.setChecked(False)
-            self.btn_invert_polarity.blockSignals(False)
         self._rebuild_montage_caches()
         self._apply_active_montage()
 
@@ -3144,11 +3126,9 @@ class SeizureAnnotationGUI(QMainWindow):
         """
         out = data.copy()
 
-        # 0.5 Hz high-pass (4th order Butterworth via second-order sections)
         nyq = fs / 2.0
         hp_sos = butter(4, 0.5 / nyq, btype="high", output="sos")
 
-        # 60 Hz notch — skip if fs is too low to represent 60 Hz
         notch_sos = None
         if nyq > 61:
             b_n, a_n = iirnotch(60.0 / nyq, Q=30)
@@ -3268,11 +3248,7 @@ class SeizureAnnotationGUI(QMainWindow):
         target_uv = CHANNEL_SPACING_UV * 0.40
         return target_uv / p90
 
-    # ── Polarity + montage caches ─────────────────────────────────────────────
-
-    def _display_polarity_sign(self) -> float:
-        """Lab convention is -1; button checked removes that flip for manual override."""
-        return 1.0 if self.polarity_inverted else -1.0
+    # ── Montage caches ────────────────────────────────────────────────────────
 
     def _rebuild_montage_caches(self) -> None:
         if self._ref_eeg_data_base is None:
@@ -3290,40 +3266,42 @@ class SeizureAnnotationGUI(QMainWindow):
             self._compute_ap_bipolar_montage(ref, names)
         )
 
+    def _selected_montage_mode(self) -> str:
+        if hasattr(self, "montage_combo"):
+            mode = self.montage_combo.currentData()
+            if mode:
+                return str(mode)
+        return self.montage
+
     def _apply_active_montage(self) -> None:
         if self._ref_eeg_data_base is None:
             return
-        self.montage = "banana"
-        if self.eeg_data_banana is not None:
-            self.eeg_data = self.eeg_data_banana
-            self.channel_names_all = list(self.channel_names_banana)
-        else:
+        mode = self._selected_montage_mode()
+        if mode == "referential":
+            self.montage = "referential"
             self.eeg_data = self._ref_eeg_data
             self.channel_names_all = list(self._ref_channel_names)
+        else:
+            self.montage = "banana"
+            if self.eeg_data_banana is not None:
+                self.eeg_data = self.eeg_data_banana
+                self.channel_names_all = list(self.channel_names_banana)
+            else:
+                self.eeg_data = self._ref_eeg_data
+                self.channel_names_all = list(self._ref_channel_names)
 
     def _commit_referential_data(
         self,
         ref_base: np.ndarray,
         channel_names: list[str],
-        *,
-        default_invert: bool,
     ) -> None:
         self._ref_eeg_data_base = ref_base.astype(np.float32)
         self._ref_channel_names = list(channel_names)
-        self.channel_names_all = list(channel_names)
-        self.polarity_inverted = default_invert
-        if hasattr(self, "btn_invert_polarity"):
-            self.btn_invert_polarity.blockSignals(True)
-            self.btn_invert_polarity.setChecked(default_invert)
-            self.btn_invert_polarity.blockSignals(False)
         self._rebuild_montage_caches()
         self._apply_active_montage()
 
-    def _on_invert_polarity_toggled(self, checked: bool) -> None:
-        self.polarity_inverted = checked
-        if self.eeg_data is None:
-            return
-        self._draw_traces()
+    def _on_montage_combo_changed(self, _index: int) -> None:
+        self._set_montage(self._selected_montage_mode())
 
     def _set_view(self, mode: str):
         self.view_mode = "all"
@@ -3331,10 +3309,14 @@ class SeizureAnnotationGUI(QMainWindow):
         self._rebuild_displayed_channels()
 
     def _set_montage(self, mode: str | None = None):
-        """Banana montage only (mode argument ignored for compatibility)."""
-        del mode
         if self._ref_eeg_data_base is None:
             return
+        if mode is not None and hasattr(self, "montage_combo"):
+            idx = self.montage_combo.findData(mode)
+            if idx >= 0 and self.montage_combo.currentIndex() != idx:
+                self.montage_combo.blockSignals(True)
+                self.montage_combo.setCurrentIndex(idx)
+                self.montage_combo.blockSignals(False)
         self._apply_active_montage()
         self._populate_channel_list()
         self._rebuild_displayed_channels()
@@ -3376,8 +3358,11 @@ class SeizureAnnotationGUI(QMainWindow):
                 prev_real_shown = True
             i += 1
 
-        # First montage rows (frontal / Fp1–F7) at top of the plot.
-        self.displayed_channels = list(reversed(out))
+        if self.montage == "banana":
+            # Frontal chains (e.g. Fp1–F7) at top of the plot.
+            self.displayed_channels = list(reversed(out))
+        else:
+            self.displayed_channels = out
         if not any(not c.startswith("__SPACER_") for c in self.displayed_channels):
             self.status_bar.showMessage("No channels visible — check channels in the list.")
 
@@ -3642,7 +3627,7 @@ class SeizureAnnotationGUI(QMainWindow):
         self._add_spike_window_markers(t_start, t_end)
 
         soz_set = self.soz_channels
-        midline_green = self.banana_midline_pairs
+        midline_green = self.banana_midline_pairs if self.montage == "banana" else set()
 
         # Y ticks: one per channel
         tick_positions = []
@@ -3664,7 +3649,7 @@ class SeizureAnnotationGUI(QMainWindow):
                 continue
 
             segment = self.eeg_data[s_start:s_end, ch_idx]
-            y = baseline + segment * self.gain * self._display_polarity_sign()
+            y = baseline + segment * self.gain
 
             if ch_name.startswith("__SPACER_"):
                 colour = (220, 220, 220)
