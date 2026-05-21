@@ -1445,9 +1445,8 @@ _CHAIN_PARASAG_R: list[tuple[list[str], list[str]]] = [
     (["C4"], ["P4"]),
     (["P4"], ["O2"]),
 ]
-# Build Cz-Pz before Fz-Cz so reversed display shows Fz-Cz then Cz-Pz (top to bottom).
+# Midline banana chain (no Pz — synthetic Pz is referential-only).
 _CHAIN_MIDLINE: list[tuple[list[str], list[str]]] = [
-    (["Cz"], ["Pz"]),
     (["Fz"], ["Cz"]),
 ]
 
@@ -2771,106 +2770,49 @@ class SeizureAnnotationGUI(QMainWindow):
         QApplication.processEvents()
 
         try:
-            # Import here so environments that only use --data_dir don't require `ieeg`.
-            from ieeg.auth import Session
+            from ieeg_load_preprocess import CHANNELS_TO_INCLUDE, load_and_preprocess_window
 
-            chunk_seconds = 60.0
+            use_flat = (
+                getattr(self, "btn_ieeg_no_spike", None) is not None
+                and self.btn_ieeg_no_spike.isChecked()
+            )
+            spike_time = None if use_flat else selected_spike_time
+            if spike_time is None and not use_flat and self.current_patient:
+                spike_time = self.ieeg_spike_time_by_dataset.get(self.current_patient)
+            if spike_time is None and not use_flat:
+                spike_time = self.ieeg_spike_time_by_dataset.get(dataset_id)
+            half = float(IEEG_SPIKE_HALF_WINDOW_SEC)
+            if spike_time is not None and not use_flat:
+                window_start_sec = max(0.0, float(spike_time) - half)
+                window_end_sec = float(spike_time) + half
+            else:
+                window_start_sec = 0.0
+                window_end_sec = 2.0 * half
 
-            with Session(self.ieeg_username, self.ieeg_password) as s:
-                # Try exact id (e.g. "... .edf"), then fallback without suffix.
-                try:
-                    ds = s.open_dataset(dataset_id)
-                except Exception:
-                    ds = s.open_dataset(dataset_id.removesuffix(".edf"))
-
-                channel_labels = list(ds.get_channel_labels())
-                if not channel_labels:
-                    raise ValueError("No channel labels found in the iEEG dataset.")
-
-                # Sample rate + number of samples come from the first timeseries.
-                first_details = ds.get_time_series_details(channel_labels[0])
-                fs_attr = getattr(first_details, "sample_frequency", None)
-                self.fs = float(
-                    fs_attr if fs_attr is not None else first_details.sample_rate
+            window_duration_sec = max(0.0, window_end_sec - window_start_sec)
+            self.total_duration = window_duration_sec
+            self.time_offset_sec = window_start_sec
+            if spike_time is not None and not use_flat:
+                self.clip_spike_abs_sec = float(spike_time)
+                self.clip_spike_rel_sec = float(spike_time) - window_start_sec
+            else:
+                self.clip_spike_abs_sec = None
+                self.clip_spike_rel_sec = None
+            if window_duration_sec <= 0:
+                raise ValueError(
+                    f"Invalid data window for dataset {dataset_id}. "
+                    f"Spike time may be outside recording bounds."
                 )
-                self.channel_names_all = channel_labels
 
-                # Map channel labels -> indices for ds.get_data.
-                try:
-                    channel_ids = list(ds.get_channel_indices(channel_labels))
-                except Exception:
-                    channel_ids = list(range(len(channel_labels)))
-
-                # Align with EDF handler: prefer a stable core-channel subset/order.
-                selected_labels = [ch for ch in CORE_EEG_CHANNELS if ch in channel_labels]
-                if selected_labels:
-                    try:
-                        channel_ids = list(ds.get_channel_indices(selected_labels))
-                        self.channel_names_all = selected_labels
-                    except Exception:
-                        # Fallback to all channels if mapping fails.
-                        self.channel_names_all = channel_labels
-                else:
-                    self.channel_names_all = channel_labels
-
-                # Spike-centered window ±IEEG_SPIKE_HALF_WINDOW_SEC, or flat 0…2×half when no spike.
-                use_flat = (
-                    getattr(self, "btn_ieeg_no_spike", None) is not None
-                    and self.btn_ieeg_no_spike.isChecked()
-                )
-                spike_time = None if use_flat else selected_spike_time
-                if spike_time is None and not use_flat and self.current_patient:
-                    spike_time = self.ieeg_spike_time_by_dataset.get(self.current_patient)
-                if spike_time is None and not use_flat:
-                    spike_time = self.ieeg_spike_time_by_dataset.get(dataset_id)
-                half = float(IEEG_SPIKE_HALF_WINDOW_SEC)
-                if spike_time is not None and not use_flat:
-                    window_start_sec = max(0.0, float(spike_time) - half)
-                    window_end_sec = float(spike_time) + half
-                else:
-                    window_start_sec = 0.0
-                    window_end_sec = 2.0 * half
-
-                window_duration_sec = max(0.0, window_end_sec - window_start_sec)
-                self.total_duration = window_duration_sec
-                self.time_offset_sec = window_start_sec
-                if spike_time is not None and not use_flat:
-                    self.clip_spike_abs_sec = float(spike_time)
-                    self.clip_spike_rel_sec = float(spike_time) - window_start_sec
-                else:
-                    self.clip_spike_abs_sec = None
-                    self.clip_spike_rel_sec = None
-                if window_duration_sec <= 0:
-                    raise ValueError(
-                        f"Invalid data window for dataset {dataset_id}. "
-                        f"Spike time may be outside recording bounds."
-                    )
-
-                # Download the selected window into memory using usec chunks,
-                # same strategy as notebook helper.
-                raw_chunks: list[np.ndarray] = []
-                chunk_usec = int(chunk_seconds * 1e6)
-                start_usec = int(window_start_sec * 1e6)
-                stop_usec = int(window_end_sec * 1e6)
-                clip_start = start_usec
-                while clip_start < stop_usec:
-                    duration_usec = min(chunk_usec, stop_usec - clip_start)
-                    data_chunk = ds.get_data(clip_start, duration_usec, channel_ids)
-                    data_chunk = np.asarray(data_chunk, dtype=np.float32)
-                    data_chunk = np.nan_to_num(
-                        data_chunk, nan=0.0, posinf=0.0, neginf=0.0
-                    )
-
-                    raw_chunks.append(data_chunk)
-                    clip_start += duration_usec
-
-                raw_data = np.concatenate(raw_chunks, axis=0)
-
-                # Convert to microvolts for the existing preprocessing/plotting code.
-                vcf = float(getattr(first_details, "voltage_conversion_factor", 1.0))
-                raw_uv = raw_data * vcf * IEEG_SCALE
-                ref_base = self._preprocess(raw_uv, self.fs).astype(np.float32)
-                self._commit_referential_data(ref_base, list(self.channel_names_all))
+            ref_base, channel_names, self.fs = load_and_preprocess_window(
+                self.ieeg_username,
+                self.ieeg_password,
+                dataset_id,
+                int(window_start_sec * 1e6),
+                int(window_end_sec * 1e6),
+                CHANNELS_TO_INCLUDE,
+            )
+            self._commit_referential_data(ref_base, channel_names)
 
         except Exception as exc:
             QMessageBox.critical(self, "iEEG Load Error", str(exc))
@@ -2910,9 +2852,24 @@ class SeizureAnnotationGUI(QMainWindow):
             self.ictal_duration = None
             self.current_recording = edf_path.stem
 
-            data_uv = data_v * IEEG_SCALE
-            ref_base = self._preprocess(data_uv, self.fs).astype(np.float32)
-            self._commit_referential_data(ref_base, list(self.channel_names_all))
+            from ieeg_load_preprocess import (
+                NEW_CHANNEL_ORDER,
+                TARGET_FS,
+                preprocess_scalp_segment,
+            )
+
+            ch_set = set(self.channel_names_all)
+            if abs(self.fs - TARGET_FS) < 1 and set(NEW_CHANNEL_ORDER).issubset(ch_set):
+                order = [c for c in NEW_CHANNEL_ORDER if c in ch_set]
+                idx = [self.channel_names_all.index(c) for c in order]
+                ref_base = data_v[:, idx].astype(np.float32)
+                self._commit_referential_data(ref_base, order)
+            else:
+                ref_base, channel_names, self.fs = preprocess_scalp_segment(
+                    data_v, list(self.channel_names_all), int(self.fs)
+                )
+                self.total_duration = float(ref_base.shape[0] / self.fs)
+                self._commit_referential_data(ref_base, channel_names)
             spike_sec = None
             if option is not None:
                 spike_sec = option.get("spike_time_sec")

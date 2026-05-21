@@ -88,6 +88,10 @@ def clip_gui_label(row: pd.Series, index: int | None = None) -> str:
 
 
 def row_to_option(row: pd.Series, index: int) -> dict[str, Any]:
+    """
+    GUI clip options. ``timestamp_sec`` / ``spike_time_sec`` include SpikeNet2
+    SPIKENET_DELAY_SEC (+0.5 s); see spikenet_timing.py when comparing SN2 scores.
+    """
     ieeg = str(row["ieeg_file_name"]).strip()
     dataset_id = ieeg if ieeg.lower().endswith(".edf") else f"{ieeg}.edf"
     basename = clip_edf_basename(row)
@@ -129,53 +133,24 @@ def fetch_ieeg_window_uv(
     half_window_sec: float = CLIP_HALF_WINDOW_SEC,
     channels: list[str] | None = None,
 ) -> tuple[np.ndarray, list[str], float]:
-    """Download referential scalp EEG segment; return (n_samples, n_ch) µV, labels, fs."""
-    from ieeg.auth import Session
+    """Download ±window scalp EEG; lab preprocess; return (n_samples, n_ch), labels, fs."""
+    from ieeg_load_preprocess import CHANNELS_TO_INCLUDE, load_and_preprocess_window
 
-    channels = channels or CORE_EEG_CHANNELS
+    channels = channels or CHANNELS_TO_INCLUDE
     dataset_id = dataset_id.strip()
     window_start = max(0.0, float(center_sec) - float(half_window_sec))
     window_end = float(center_sec) + float(half_window_sec)
-    duration_sec = window_end - window_start
-    if duration_sec <= 0:
+    if window_end <= window_start:
         raise ValueError(f"Invalid window for {dataset_id} at {center_sec}s")
 
-    chunk_sec = 60.0
-    raw_chunks: list[np.ndarray] = []
-
-    with Session(username, password) as session:
-        try:
-            ds = session.open_dataset(dataset_id)
-        except Exception:
-            ds = session.open_dataset(dataset_id.removesuffix(".edf"))
-
-        all_labels = list(ds.get_channel_labels())
-        if not all_labels:
-            raise ValueError(f"No channels in {dataset_id}")
-
-        first_details = ds.get_time_series_details(all_labels[0])
-        fs = timeseries_sample_hz(first_details)
-        vcf = float(getattr(first_details, "voltage_conversion_factor", 1.0))
-
-        selected = [ch for ch in channels if ch in all_labels]
-        if not selected:
-            raise ValueError(f"No core EEG channels in {dataset_id}")
-        channel_ids = list(ds.get_channel_indices(selected))
-
-        start_usec = int(window_start * 1e6)
-        stop_usec = int(window_end * 1e6)
-        chunk_usec = int(chunk_sec * 1e6)
-        clip_start = start_usec
-        while clip_start < stop_usec:
-            dur = min(chunk_usec, stop_usec - clip_start)
-            chunk = np.asarray(ds.get_data(clip_start, dur, channel_ids), dtype=np.float32)
-            chunk = np.nan_to_num(chunk, nan=0.0, posinf=0.0, neginf=0.0)
-            raw_chunks.append(chunk)
-            clip_start += dur
-
-    raw = np.concatenate(raw_chunks, axis=0)
-    data_uv = raw * vcf * 1e6
-    return data_uv.astype(np.float32), selected, fs
+    return load_and_preprocess_window(
+        username,
+        password,
+        dataset_id,
+        int(window_start * 1e6),
+        int(window_end * 1e6),
+        channels,
+    )
 
 
 def write_clip_edf(

@@ -16,6 +16,22 @@ pip install -r requirements.txt
 
 3. **`run_spike_review_gui.py`** — opens the review GUI.
 
+## SpikeNet2 timestamps (`timestamp_sec` / `spikenet2_prob`)
+
+Saved spike times include a **+0.5 s** detection delay:
+
+`timestamp_sec = chunk_start_sec + peak_idx × (8/128) + 0.5`
+
+When re-running SpikeNet2 and comparing to `spikenet2_prob`, use `spikenet_timing.prob_at_saved_timestamp()` (or add **+0.5 s** to the score time axis). Comparing without the delay can pick the wrong index and a very different probability.
+
+Recheck script (optional, needs iEEG credentials + model):
+
+```powershell
+python recheck_spikenet2_probs.py --buffer-sec 30 --limit 5
+```
+
+Uses ±30 s around each event by default to reduce filter edge effects vs short clips.
+
 ## Controls
 
 | Control | Behavior |

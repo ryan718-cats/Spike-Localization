@@ -2,12 +2,19 @@ import os
 import sys
 import numpy as np
 import pandas as pd
-from scipy.signal import butter, filtfilt, iirnotch, sosfilt, resample
 import torch
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 import pytorch_lightning as pl
-from ieeg.auth import Session
+
+from ieeg_load_preprocess import (
+    CHANNELS_TO_INCLUDE,
+    CURRENT_CHANNEL_ORDER,
+    NEW_CHANNEL_ORDER,
+    TARGET_FS as FQ,
+    get_ieeg_data,
+    preprocess_scalp_segment,
+)
 from sleeplib.Resnet_15.model import FineTuning
 from sleeplib.config import Config
 from sleeplib.transforms import extremes_remover
@@ -21,68 +28,17 @@ CKPT_PATH = r"C:\Users\ryanc\Downloads\Conrad_Lab\progress_sheet\models\1s-round
 IEEG_USERNAME = os.environ.get("IEEG_USERNAME", "")
 IEEG_PASSWORD = os.environ.get("IEEG_PASSWORD", "")
 
-FQ = 128
+from spikenet_timing import (
+    SPIKENET_DELAY_SEC,
+    SPIKENET_STEP_SAMPLES as STEP_SAMPLES,
+    SPIKENET_STEP_SEC as STEP_SEC,
+)
+
 WINDOW_SIZE_SEC = 1
-STEP_SAMPLES = 8
-STEP_SEC = STEP_SAMPLES / FQ
 
 SPIKE_THRESH = 0.43
-SPIKENET_DELAY_SEC = 0.5
 
 sys.path.insert(0, SLEEPLIB_PARENT)
-
-def get_iEEG_data(username, password, iEEG_filename, start_time_usec, stop_time_usec, select_electrodes=None):
-    start_time_usec = int(start_time_usec)
-    stop_time_usec = int(stop_time_usec)
-    duration = stop_time_usec - start_time_usec
-    s = Session(username, password)
-    ds = s.open_dataset(iEEG_filename)
-    all_channel_labels = ds.get_channel_labels()
-    if select_electrodes is None:
-        channel_ids = list(range(len(all_channel_labels)))
-        channel_names = all_channel_labels
-    else:
-        if not isinstance(select_electrodes, (list, tuple)) or not isinstance(select_electrodes[0], str):
-            raise ValueError("select_electrodes must be a list of strings.")
-        channel_ids = [i for i, e in enumerate(all_channel_labels) if e in select_electrodes]
-        if len(channel_ids) == 0:
-            raise ValueError("None of the requested channels were found in this dataset.")
-        channel_names = [all_channel_labels[i] for i in channel_ids]
-    try:
-        data = ds.get_data(start_time_usec, duration, channel_ids)
-    except Exception:
-        clip_size = int(60 * 1e6)
-        clip_start = start_time_usec
-        chunks = []
-        while clip_start + clip_size < stop_time_usec:
-            chunks.append(ds.get_data(clip_start, clip_size, channel_ids))
-            clip_start += clip_size
-        chunks.append(ds.get_data(clip_start, stop_time_usec - clip_start, channel_ids))
-        data = np.concatenate(chunks, axis=0)
-    df = pd.DataFrame(data, columns=channel_names)
-    fs = ds.get_time_series_details(ds.ch_labels[0]).sample_rate
-    return df, int(fs)
-
-def notch_filter(data, hz, fs):
-    b, a = iirnotch(hz, Q=30, fs=fs)
-    return filtfilt(b, a, data, axis=0)
-
-def high_pass_filter(data, cutoff, fs, order=4):
-    nyquist = 0.5 * fs
-    b, a = butter(order, cutoff / nyquist, btype="high", analog=False)
-    return filtfilt(b, a, data, axis=0)
-
-def downsample_with_filter(data, original_fs, target_fs, cutoff=None, order=5):
-    num_samples, _ = data.shape
-    downsample_factor = original_fs // target_fs
-    if downsample_factor < 2:
-        raise ValueError(f"Downsampling factor must be at least 2. original_fs={original_fs}, target_fs={target_fs}")
-    if cutoff is None:
-        cutoff = target_fs / 2.0
-    sos = butter(order, cutoff / (0.5 * original_fs), btype="low", output="sos")
-    filtered = sosfilt(sos, data, axis=0)
-    downsampled = resample(filtered, num_samples // downsample_factor, axis=0)
-    return downsampled
 
 class ContinousToSnippetDataset(Dataset):
     def __init__(self, signal_data, montage=None, transform=None, Fq=128, window_size=1, step=8):
@@ -105,18 +61,9 @@ class ContinousToSnippetDataset(Dataset):
         x = self._preprocess(x)
         return x, 0
 
-channels_to_include = [
-    "C3","C4","Cz","F3","F4","F7","F8","Fp1","Fp2",
-    "Fz","O1","O2","P3","P4","T3","T4","T5","T6"
-]
-current_channel_order = [
-    "C3","C4","Cz","F3","F4","F7","F8","Fp1","Fp2",
-    "Fz","O1","O2","P3","P4","T3","T4","T5","T6","Pz"
-]
-new_channel_order = [
-    "Fp1","F3","C3","P3","F7","T3","T5","O1","Fz",
-    "Cz","Pz","Fp2","F4","C4","P4","F8","T4","T6","O2"
-]
+channels_to_include = CHANNELS_TO_INCLUDE
+current_channel_order = CURRENT_CHANNEL_ORDER
+new_channel_order = NEW_CHANNEL_ORDER
 
 def format_hhmmss(seconds: float) -> str:
     seconds = max(0.0, float(seconds))
@@ -157,7 +104,52 @@ from itertools import combinations
 import numpy as np
 import pandas as pd
 from torch.utils.data import DataLoader
-from scipy.signal import butter, filtfilt
+
+
+def predict_sn2_trace(reordered_data: np.ndarray) -> np.ndarray:
+    """Run SpikeNet2 on preprocessed/reordered segment; return flat SN2 scores."""
+    dataset = ContinousToSnippetDataset(
+        signal_data=reordered_data.T,
+        montage=montage_fn,
+        transform=transform_test,
+        window_size=WINDOW_SIZE_SEC,
+        step=STEP_SAMPLES,
+        Fq=FQ,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=128,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=(device == "cuda"),
+    )
+    preds = trainer.predict(model, loader)
+    return np.concatenate(preds).astype(float).flatten()
+
+
+def predict_sn2_for_ieeg_window(
+    ieeg_file: str,
+    start_sec: float,
+    end_sec: float,
+) -> tuple[np.ndarray, float]:
+    """
+    Download [start_sec, end_sec], lab-preprocess, run SpikeNet2.
+
+    Returns (sn2_scores, chunk_start_sec) for use with spikenet_timing.prob_at_saved_timestamp.
+    """
+    chunk_start = float(start_sec)
+    df, fs = get_iEEG_data(
+        username=IEEG_USERNAME,
+        password=IEEG_PASSWORD,
+        iEEG_filename=ieeg_file,
+        start_time_usec=int(chunk_start * 1e6),
+        stop_time_usec=int(end_sec * 1e6),
+        select_electrodes=channels_to_include,
+    )
+    reordered, _, _ = preprocess_scalp_segment(
+        df.values, list(df.columns), fs, target_fs=FQ
+    )
+    return predict_sn2_trace(reordered), chunk_start
 
 
 def localization(ieeg_file, start_sec):
@@ -179,20 +171,9 @@ def localization(ieeg_file, start_sec):
         print(f"Skipping {ieeg_file_name}: could not load from iEEG ({e})")
         return None
 
-    segment_data = df.values
-    if np.isnan(segment_data).any():
-        segment_data = np.nan_to_num(segment_data, nan=0.0)
-
-    notch_data = notch_filter(segment_data, hz=60, fs=fs)
-    hp_data = high_pass_filter(notch_data, cutoff=0.5, fs=fs)
-    ds_data = downsample_with_filter(hp_data, original_fs=fs, target_fs=FQ)
-
-    pz_indices = [2, 12, 13, 10, 11]
-    pz_mean = np.mean(ds_data[:, pz_indices], axis=1)
-    ds_with_pz = np.column_stack((ds_data, pz_mean))
-
-    reorder_index = [current_channel_order.index(ch) for ch in new_channel_order]
-    reordered_data = ds_with_pz[:, reorder_index]
+    reordered_data, _, _ = preprocess_scalp_segment(
+        df.values, list(df.columns), fs, target_fs=FQ
+    )
     base_reordered_data = reordered_data.copy()
 
     brain_region = {
@@ -211,23 +192,7 @@ def localization(ieeg_file, start_sec):
     }
 
     def get_max_prob(temp_data):
-        dataset = ContinousToSnippetDataset(
-            signal_data=temp_data.T,
-            montage=montage_fn,
-            transform=transform_test,
-            window_size=WINDOW_SIZE_SEC,
-            step=STEP_SAMPLES,
-            Fq=FQ,
-        )
-        loader = DataLoader(
-            dataset,
-            batch_size=128,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=(device == "cuda"),
-        )
-        preds = trainer.predict(model, loader)
-        SN2 = np.concatenate(preds).astype(float).flatten()
+        SN2 = predict_sn2_trace(temp_data)
         return float(np.max(SN2)) if SN2.size else 0.0
 
     def generate_eeg_channel(n_samples, fs=128, beta=1.0, rng=None):
@@ -246,6 +211,8 @@ def localization(ieeg_file, start_sec):
 
         low = 0.5 / (fs / 2)
         high = 40 / (fs / 2)
+        from scipy.signal import butter, filtfilt
+
         b, a = butter(4, [low, high], btype="band")
         eeg = filtfilt(b, a, eeg)
 
