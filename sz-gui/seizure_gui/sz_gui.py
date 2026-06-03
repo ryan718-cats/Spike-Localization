@@ -33,6 +33,7 @@ import os
 import io
 import re
 import json
+import csv
 import argparse
 from pathlib import Path
 from datetime import datetime
@@ -70,12 +71,14 @@ VISIBLE_SECONDS = 3.0        # visible EEG window (seconds)
 TIME_SCROLL_STEP_SEC = 0.25  # horizontal scroll step (seconds); ←→ and time scrollbar arrows
 SCROLL_TICKS_PER_SEC = 4     # scrollbar resolution (1 tick = TIME_SCROLL_STEP_SEC)
 IEEG_SPIKE_HALF_WINDOW_SEC = 7.0   # ± this many seconds around spike (14 s total)
-SPIKE_MARK_HALF_WIDTH_SEC = 0.5    # ±0.5 s red lines + shaded band on the plot
+CLIP_SPIKE_REGION_START_SEC = 7.0  # highlighted spike window in local ±7 s clips
+CLIP_SPIKE_REGION_END_SEC = 8.0
+SPIKE_MARK_HALF_WIDTH_SEC = 0.5    # ±0.5 s band when streaming (non-clip) iEEG
 SPIKE_MARK_LINE_COLOR = (220, 40, 40)
 SPIKE_MARK_FILL_COLOR = (255, 180, 180, 70)
 GAIN_STEP = 1.5              # multiply/divide per ↑↓ key press
-GAIN_MIN = 1e-6              # minimum gain (wider range than before)
-GAIN_MAX = 1e6               # maximum gain (wider range than before)
+GAIN_MIN = 1e-9              # minimum gain (wide ↑↓ range; step unchanged)
+GAIN_MAX = 1e9               # maximum gain (wide ↑↓ range; step unchanged)
 IEEG_SCALE = 1e6             # convert Volts → µV
 
 # Colour used for the ictal background shading
@@ -1421,6 +1424,17 @@ def match_channel(target: str, candidates: list[str]) -> str | None:
 
 
 # Shared chain definitions (alias-aware left/right option lists).
+# Subtemporal (inferior) chains — only appear when F9/T9/P9 (or F10/T10/P10) exist.
+_CHAIN_SUBTEMPORAL_L: list[tuple[list[str], list[str]]] = [
+    (["Fp1"], ["F9"]),
+    (["F9"], ["T9"]),
+    (["T9"], ["P9"]),
+]
+_CHAIN_SUBTEMPORAL_R: list[tuple[list[str], list[str]]] = [
+    (["Fp2"], ["F10"]),
+    (["F10"], ["T10"]),
+    (["T10"], ["P10"]),
+]
 _CHAIN_TEMPORAL_L: list[tuple[list[str], list[str]]] = [
     (["Fp1"], ["F7"]),
     (["F7"], ["T3", "T7"]),
@@ -1445,18 +1459,27 @@ _CHAIN_PARASAG_R: list[tuple[list[str], list[str]]] = [
     (["C4"], ["P4"]),
     (["P4"], ["O2"]),
 ]
-# Midline banana chain (no Pz — synthetic Pz is referential-only).
-_CHAIN_MIDLINE: list[tuple[list[str], list[str]]] = [
+
+# Central chain below T6–O2 (Cz–Pz only when Pz is present in the recording).
+_CHAIN_CENTRAL: list[tuple[list[str], list[str]]] = [
     (["Fz"], ["Cz"]),
+    (["Cz"], ["Pz"]),
 ]
 
-# Classic double-banana order: L temp → R temp → L parasag → R parasag → midline.
+# Longitudinal bipolar montage: subtemporal L/R → temporal L/R → parasag L/R → central.
 BANANA_CHAIN_GROUPS: list[tuple[str, list[tuple[list[str], list[str]]]]] = [
+    ("subtemporal_left", _CHAIN_SUBTEMPORAL_L),
+    ("subtemporal_right", _CHAIN_SUBTEMPORAL_R),
     ("temporal_left", _CHAIN_TEMPORAL_L),
     ("temporal_right", _CHAIN_TEMPORAL_R),
     ("parasag_left", _CHAIN_PARASAG_L),
     ("parasag_right", _CHAIN_PARASAG_R),
-    ("midline", _CHAIN_MIDLINE),
+    ("central", _CHAIN_CENTRAL),
+]
+
+# AP bipolar: L temp → L central → R temp → R central (legacy).
+_CHAIN_MIDLINE: list[tuple[list[str], list[str]]] = [
+    (["Fz"], ["Cz"]),
 ]
 
 # AP bipolar: same chains, clinical ordering L temp → L central → R temp → R central → midline.
@@ -1473,8 +1496,10 @@ def _compute_chain_groups_montage(
     data: np.ndarray,
     channel_names: list[str],
     groups: list[tuple[str, list[tuple[list[str], list[str]]]]],
+    *,
+    include_spacers: bool = True,
 ) -> tuple[np.ndarray, list[str], set[str]]:
-    """Build longitudinal bipolar chains with spacers; *midline* pairs go to returned set."""
+    """Build longitudinal bipolar chains; optional spacers between chain groups."""
     norm_to_actual: dict[str, str] = {
         normalize_channel_name(ch.upper()): ch for ch in channel_names
     }
@@ -1492,7 +1517,7 @@ def _compute_chain_groups_montage(
     midline_pairs: set[str] = set()
     spacer_count = 0
     for gidx, (group_name, chains) in enumerate(groups):
-        if gidx > 0:
+        if include_spacers and gidx > 0:
             spacer_count += 1
             montage_cols.append(np.zeros(data.shape[0], dtype=data.dtype))
             montage_names.append(f"__SPACER_{spacer_count}__")
@@ -1518,6 +1543,39 @@ def _compute_chain_groups_montage(
 def load_soz_csv() -> pd.DataFrame:
     """Parse the SOZ electrode table from the embedded string constant."""
     return pd.read_csv(io.StringIO(_SOZ_CSV_DATA))
+
+
+def _format_clip_timestamp_sec(timestamp_sec: float) -> str:
+    """Format timestamp like spike clip EDF names (e.g. 32621.8438)."""
+    return f"{float(timestamp_sec):.4f}".rstrip("0").rstrip(".")
+
+
+def clip_display_stem(ieeg_file_name: str, timestamp_sec: float) -> str:
+    """Human-readable clip id (e.g. EMU1049_Day08_1_32621.8438)."""
+    return f"{ieeg_file_name}_{_format_clip_timestamp_sec(timestamp_sec)}"
+
+
+def clip_annotation_stem(ieeg_file_name: str, timestamp_sec: float) -> str:
+    """Recording id for annotation JSON (e.g. EMU1049_Day08_1_32621.8438.edf)."""
+    return f"{clip_display_stem(ieeg_file_name, timestamp_sec)}.edf"
+
+
+def load_clip_shuffle_key(folder: Path) -> dict[str, dict]:
+    """Map clip file stem (clip_001 or EMU…_timestamp) → shuffle-key row."""
+    key_path = folder / "clip_shuffle_key.csv"
+    if not key_path.is_file():
+        return {}
+    by_stem: dict[str, dict] = {}
+    with key_path.open(newline="", encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            out = (row.get("output_name") or "").strip()
+            if out:
+                by_stem[Path(out).stem] = row
+            ieeg = (row.get("ieeg_file_name") or "").strip()
+            ts_raw = (row.get("timestamp_sec") or "").strip()
+            if ieeg and ts_raw:
+                by_stem[clip_display_stem(ieeg, float(ts_raw))] = row
+    return by_stem
 
 
 # ── Channel Annotation Dialog ──────────────────────────────────────────────────
@@ -1690,6 +1748,7 @@ class SeizureAnnotationGUI(QMainWindow):
         ieeg_edf_trim_ext: str = ".edf",
         clips_csv: str | None = None,
         clip_edf_dir: str | None = None,
+        clip_scan_dir: str | None = None,
     ):
         super().__init__()
 
@@ -1702,14 +1761,27 @@ class SeizureAnnotationGUI(QMainWindow):
         # - explicit dataset id
         # - CSV mapping (patient -> dataset ids)
         # - CSV listing (selections.csv -> dataset ids)
+        # - clips CSV (final_selected_200_events.csv)
+        # - clip folder scan (blinded clip_*.edf review, no CSV)
         self.clips_csv: Path | None = Path(clips_csv) if clips_csv else None
-        self.clip_edf_dir: Path | None = Path(clip_edf_dir) if clip_edf_dir else None
+        self.clips_folder_dir: Path | None = (
+            Path(clip_scan_dir) if clip_scan_dir else None
+        )
+        self._clips_review_ui_configured = False
+        # Folder-scan reviews load their EDFs straight from the scanned folder.
+        if clip_edf_dir:
+            self.clip_edf_dir: Path | None = Path(clip_edf_dir)
+        elif self.clips_folder_dir is not None:
+            self.clip_edf_dir = self.clips_folder_dir
+        else:
+            self.clip_edf_dir = None
         self.clip_metadata_by_label: dict[str, dict] = {}
         self.ieeg_mode: bool = (
             self.ieeg_dataset_id is not None
             or ieeg_patient_datasets_csv is not None
             or ieeg_edf_options_csv is not None
             or self.clips_csv is not None
+            or self.clips_folder_dir is not None
         )
         self.patient_id_for_annotations: str = patient_id or "ieeg"
         self.ieeg_ictal_onset_sec: float | None = ictal_onset_sec
@@ -1776,10 +1848,12 @@ class SeizureAnnotationGUI(QMainWindow):
         self.ictal_region: pg.LinearRegionItem | None = None
 
         # ── montage ───────────────────────────────────────────────────────────
-        self.montage: str = "referential"             # referential | bipolar | banana | ap_bipolar
+        self.montage: str = "car"                     # car | banana | bipolar | ap_bipolar
         self._ref_eeg_data_base: np.ndarray | None = None  # referential µV (as loaded)
         self._ref_eeg_data: np.ndarray | None = None
         self._ref_channel_names: list[str] = []
+        self.eeg_data_car: np.ndarray | None = None
+        self.channel_names_car: list[str] = []
         self.eeg_data_bipolar: np.ndarray | None = None
         self.channel_names_bipolar: list[str] = []
         self.eeg_data_banana: np.ndarray | None = None
@@ -1844,12 +1918,15 @@ class SeizureAnnotationGUI(QMainWindow):
         row1.addWidget(self.btn_next_patient)
 
         self.btn_ieeg_no_spike = QPushButton("No spike")
-        self.btn_ieeg_no_spike.setCheckable(True)
         self.btn_ieeg_no_spike.setToolTip(
             "Mark this clip as no visible spike (saved in annotations). "
             "In legacy selections.csv mode, also toggles loading the first 14 s of the recording."
         )
-        self.btn_ieeg_no_spike.toggled.connect(self._on_ieeg_no_spike_toggled)
+        if self.clips_mode:
+            self.btn_ieeg_no_spike.clicked.connect(self._on_no_spike_clicked)
+        else:
+            self.btn_ieeg_no_spike.setCheckable(True)
+            self.btn_ieeg_no_spike.toggled.connect(self._on_ieeg_no_spike_toggled)
         if self.ieeg_mode:
             row1.addWidget(self.btn_ieeg_no_spike)
 
@@ -1864,7 +1941,7 @@ class SeizureAnnotationGUI(QMainWindow):
         row1.addWidget(self.recording_combo)
 
         # In selections/clips CSV iEEG mode, "patient" is the only selector.
-        if self.ieeg_mode and (self.ieeg_edf_options_csv or self.clips_csv):
+        if self.ieeg_mode and (self.ieeg_edf_options_csv or self.clips_mode):
             self.recording_label.hide()
             self.recording_combo.hide()
 
@@ -1887,12 +1964,12 @@ class SeizureAnnotationGUI(QMainWindow):
 
         row1.addWidget(QLabel("Montage:"))
         self.montage_combo = QComboBox()
-        self.montage_combo.addItem("As recorded", "referential")
-        self.montage_combo.addItem("Banana", "banana")
+        self.montage_combo.addItem("Common average", "car")
+        self.montage_combo.addItem("Longitudinal", "banana")
         self.montage_combo.setCurrentIndex(1)
         self.montage_combo.setToolTip(
-            "As recorded: each scalp channel as stored (referential). "
-            "Banana: double-banana chain pairs."
+            "Common average: each scalp channel minus the mean across all channels. "
+            "Longitudinal: subtemporal → temporal → parasagittal bipolar chains."
         )
         self.montage_combo.currentIndexChanged.connect(self._on_montage_combo_changed)
         row1.addWidget(self.montage_combo)
@@ -2003,10 +2080,11 @@ class SeizureAnnotationGUI(QMainWindow):
         _chfont = QFont("Monospace", 8)
         self.ch_list.setFont(_chfont)
         rpl.addWidget(self.ch_list)
-        rpl.addWidget(QLabel(
+        self.clips_channel_help_label = QLabel(
             "<i>Uncheck to hide from montage. 10–20 map: click to mark. "
             "Trace row click: remove marks on that row.</i>"
-        ))
+        )
+        rpl.addWidget(self.clips_channel_help_label)
 
         rpl.addSpacing(10)
         rpl.addWidget(QLabel("<b>Channel Annotations</b>"))
@@ -2017,7 +2095,10 @@ class SeizureAnnotationGUI(QMainWindow):
         rpl.addWidget(QLabel("<i>Double-click annotation to delete</i>"))
         rpl.addStretch(1)
 
-        rpl.addWidget(QLabel("<b>10–20 schematic</b> <small>(vector)</small>"))
+        self.montage_1020_title_label = QLabel(
+            "<b>10–20 schematic</b> <small>(vector)</small>"
+        )
+        rpl.addWidget(self.montage_1020_title_label)
         self.montage_1020_label = TenTwentyShapeMontageWidget()
         self.montage_1020_label.setMinimumHeight(420)
         self.montage_1020_label.setMaximumHeight(560)
@@ -2061,10 +2142,18 @@ class SeizureAnnotationGUI(QMainWindow):
         QShortcut(QKeySequence(Qt.Key_Left), self, lambda: self._nudge_time_scroll(-1))
         QShortcut(QKeySequence(Qt.Key_Right), self, lambda: self._nudge_time_scroll(1))
 
+    @property
+    def clips_mode(self) -> bool:
+        """True for both CSV-driven and folder-scan clip review."""
+        return self.clips_csv is not None or self.clips_folder_dir is not None
+
     def _init_ieeg_recording(self):
         """Populate UI controls for a single iEEG.org dataset."""
         if self.clips_csv:
             self._init_from_clips_csv()
+            return
+        if self.clips_folder_dir:
+            self._init_from_clip_folder()
             return
 
         if self.ieeg_patient_datasets_csv:
@@ -2416,10 +2505,151 @@ class SeizureAnnotationGUI(QMainWindow):
         edf_hint = (
             f" Local EDF folder: {self.clip_edf_dir}" if self.clip_edf_dir else " (stream from iEEG.org)"
         )
+        self._configure_clips_review_ui()
         self.status_bar.showMessage(
             f"Loaded {len(clip_ids)} clips from {src}.{edf_hint} Select a clip."
         )
         self._apply_active_montage()
+
+    def _init_from_clip_folder(self):
+        """Populate dropdown by scanning blinded clip EDFs in a folder."""
+        folder = self.clips_folder_dir
+        if not folder or not folder.is_dir():
+            QMessageBox.critical(
+                self, "Clip Folder Error", f"Clip folder not found: {folder}"
+            )
+            return
+
+        shuffle = load_clip_shuffle_key(folder)
+
+        def _review_order(path: Path) -> int:
+            row = shuffle.get(path.stem)
+            if row and str(row.get("review_order", "")).strip().isdigit():
+                return int(row["review_order"])
+            return 10**9
+
+        edf_files = sorted(
+            (p for p in folder.glob("*.edf") if p.is_file()),
+            key=_review_order,
+        )
+        if not edf_files:
+            QMessageBox.critical(
+                self, "Clip Folder Error", f"No .edf files found in {folder}"
+            )
+            return
+
+        clip_ids: list[str] = []
+        selection_options: dict[str, dict] = {}
+        parsed_spike_times: dict[str, float | None] = {}
+        metadata_by_label: dict[str, dict] = {}
+
+        for i, path in enumerate(edf_files):
+            file_stem = path.stem
+            row = shuffle.get(file_stem)
+            ieeg_name = file_stem
+            ts: float | None = None
+            clip_type = ""
+            original_name = path.name
+            review_order = i + 1
+            if row:
+                ieeg_name = (row.get("ieeg_file_name") or file_stem).strip()
+                ts_raw = (row.get("timestamp_sec") or "").strip()
+                if ts_raw:
+                    ts = float(ts_raw)
+                clip_type = (row.get("clip_type") or row.get("selection_type") or "").strip()
+                original_name = (row.get("original_name") or path.name).strip()
+                ro_raw = str(row.get("review_order", "")).strip()
+                if ro_raw.isdigit():
+                    review_order = int(ro_raw)
+
+            if ts is not None and ieeg_name:
+                display_id = clip_display_stem(ieeg_name, ts)
+                ann_stem = clip_annotation_stem(ieeg_name, ts)
+                ann_relpath = f"{ann_stem}.json"
+            else:
+                display_id = file_stem
+                ann_stem = file_stem
+                ann_relpath = f"{file_stem}.json"
+
+            opt = {
+                "dataset_id": file_stem,
+                "display_id": display_id,
+                "spike_time_sec": ts,
+                "annotation_stem": ann_stem,
+                "annotation_relpath": ann_relpath,
+                "recording_name": path.name,
+                "original_name": original_name,
+                "clip_type": clip_type,
+                "patient_id": ieeg_name,
+                "ieeg_file_name": ieeg_name,
+                "timestamp_sec": ts,
+                "review_order": review_order,
+                "row_index": i,
+            }
+            clip_ids.append(display_id)
+            selection_options[display_id] = opt
+            parsed_spike_times[display_id] = ts
+            metadata_by_label[display_id] = {
+                "row_index": i,
+                "patient_id": ieeg_name,
+                "ieeg_file_name": ieeg_name,
+                "timestamp_sec": ts,
+                "review_order": review_order,
+            }
+
+        self.ieeg_selection_options = selection_options
+        self.ieeg_spike_time_by_dataset = parsed_spike_times.copy()
+        self.clip_metadata_by_label = metadata_by_label
+        self.ieeg_patient_datasets = {
+            clip_id: [selection_options[clip_id]["dataset_id"]] for clip_id in clip_ids
+        }
+        self.patients = clip_ids
+        self.recordings = []
+        self.current_patient = None
+        self.current_recording = None
+
+        self.patient_combo.blockSignals(True)
+        self.patient_combo.clear()
+        self.patient_combo.addItem("-- Select clip --")
+        for clip_id in clip_ids:
+            ro = metadata_by_label[clip_id].get("review_order", 0)
+            self.patient_combo.addItem(f"{ro:03d}  {clip_id}", clip_id)
+        self.patient_combo.setCurrentIndex(0)
+        self.patient_combo.blockSignals(False)
+        self._update_patient_dropdown_colors()
+
+        self.recording_combo.blockSignals(True)
+        self.recording_combo.clear()
+        self.recording_combo.blockSignals(False)
+
+        self._configure_clips_review_ui()
+        self.status_bar.showMessage(
+            f"Loaded {len(clip_ids)} clips from folder {folder}. "
+            "10–20 map: click contacts to mark. Spike region 7–8 s (red band)."
+        )
+        self._apply_active_montage()
+
+    def _configure_clips_review_ui(self) -> None:
+        """Clips review: 10–20 contact marks (list only); spike band 7–8 s."""
+        if not self.clips_mode:
+            return
+        if hasattr(self, "montage_1020_title_label"):
+            self.montage_1020_title_label.show()
+        if hasattr(self, "montage_1020_label"):
+            self.montage_1020_label.show()
+        if self._clips_review_ui_configured:
+            return
+        self._clips_review_ui_configured = True
+        if hasattr(self, "clips_channel_help_label"):
+            self.clips_channel_help_label.setText(
+                "<i>Uncheck to hide traces. 10–20 map: click contacts to mark "
+                "(saved in list only). Spike window 7–8 s shown in red.</i>"
+            )
+        if self.ieeg_mode:
+            self.status_bar.showMessage(
+                "10–20 map: click contacts to mark (auto-saved). "
+                "Spike region 7–8 s.  ↑↓ amplitude.  ←→ scroll time."
+            )
 
     def _update_clip_info_label(self, label: str | None):
         """Clips mode uses dropdown text only (number | patient | timestamp)."""
@@ -2524,29 +2754,48 @@ class SeizureAnnotationGUI(QMainWindow):
         opt = self.ieeg_selection_options.get(self.current_patient)
         if not opt:
             return
-        if opt.get("clip_type") == "no_spike" and getattr(self, "btn_ieeg_no_spike", None):
-            self.btn_ieeg_no_spike.blockSignals(True)
-            self.btn_ieeg_no_spike.setChecked(True)
-            self.btn_ieeg_no_spike.setStyleSheet(
-                "font-weight: bold; background-color: #ffcc80;"
-            )
-            self.btn_ieeg_no_spike.blockSignals(False)
-            self.global_types["custom_type"] = "no_spike"
-            self._reset_global_widgets()
+        if opt.get("clip_type") == "no_spike" and not self._has_no_spike_annotation():
+            self.channel_annotations.append({
+                "channel": "(clip)",
+                "label": "no_spike",
+            })
+            self._refresh_annotation_list()
+
+    def _has_no_spike_annotation(self) -> bool:
+        for ann in self.channel_annotations:
+            label = (ann.get("label") or "").strip().lower()
+            if label == "no_spike":
+                return True
+        return False
+
+    def _toggle_no_spike_annotation(self) -> None:
+        if self._has_no_spike_annotation():
+            self.channel_annotations = [
+                ann for ann in self.channel_annotations
+                if (ann.get("label") or "").strip().lower() != "no_spike"
+            ]
+            self.status_bar.showMessage("Removed no spike mark.")
+        else:
+            self.channel_annotations.append({
+                "channel": "(clip)",
+                "label": "no_spike",
+            })
+            self.status_bar.showMessage("Marked no spike.")
+        self._refresh_annotation_list()
+        self._save_annotations()
+
+    def _on_no_spike_clicked(self) -> None:
+        if not self.clips_mode or self.eeg_data is None:
+            self.status_bar.showMessage("Load a clip first.")
+            return
+        self._toggle_no_spike_annotation()
 
     def _on_ieeg_no_spike_toggled(self, checked: bool):
-        if not self.ieeg_mode or not (self.ieeg_edf_options_csv or self.clips_csv):
+        if not self.ieeg_mode or not self.ieeg_edf_options_csv:
             return
-        self.btn_ieeg_no_spike.setStyleSheet(
-            "font-weight: bold; background-color: #ffcc80;" if checked else ""
-        )
-        if self.clips_csv:
-            # Clips are always ±7 s around timestamp_sec; button tags reviewer "no spike".
-            self.global_types["custom_type"] = "no_spike" if checked else ""
-            self._reset_global_widgets()
-            self.global_custom_type_edit.setText(self.global_types.get("custom_type", ""))
-            self._save_annotations()
-            return
+        self.global_types["custom_type"] = "no_spike" if checked else ""
+        self._reset_global_widgets()
+        self.global_custom_type_edit.setText(self.global_types.get("custom_type", ""))
         self._reload_current_ieeg_selection()
 
     def _load_current_clip(self, option: dict):
@@ -2557,32 +2806,38 @@ class SeizureAnnotationGUI(QMainWindow):
             if edf_path.exists():
                 self._load_local_clip_edf(edf_path, option)
                 return
+        if not self.ieeg_username or not self.ieeg_password:
+            self.status_bar.showMessage(
+                f"Missing local EDF for clip: {rec}. "
+                f"No iEEG credentials available to stream as fallback."
+            )
+            return
         self._load_ieeg_recording(option["dataset_id"])
 
     def _on_patient_changed(self, patient: str):
         if self.ieeg_mode:
             if not patient:
                 return
-            placeholder = "-- Select clip --" if self.clips_csv else "-- Select Patient --"
+            placeholder = "-- Select clip --" if self.clips_mode else "-- Select Patient --"
             if patient == placeholder:
                 self.current_patient = None
                 self.current_recording = None
                 self._clear_recording_state()
                 self._update_clip_info_label(None)
                 self.status_bar.showMessage(
-                    "Select a clip to load." if self.clips_csv
+                    "Select a clip to load." if self.clips_mode
                     else "Select a patient to load iEEG data."
                 )
                 return
-            if self.clips_csv:
+            if self.clips_mode:
                 clip_id = self._selected_clip_id()
                 if not clip_id:
                     return
                 patient = clip_id
             self.current_patient = patient
 
-            # selections.csv / clips.csv: one option per dropdown row.
-            if self.ieeg_edf_options_csv or self.clips_csv:
+            # selections.csv / clips.csv / folder scan: one option per dropdown row.
+            if self.ieeg_edf_options_csv or self.clips_mode:
                 option = self.ieeg_selection_options.get(patient)
                 if option is None:
                     self.status_bar.showMessage(f"No option mapping found for {patient}.")
@@ -2850,35 +3105,24 @@ class SeizureAnnotationGUI(QMainWindow):
             self.time_offset_sec = 0.0
             self.ictal_onset = None
             self.ictal_duration = None
-            self.current_recording = edf_path.stem
-
-            from ieeg_load_preprocess import (
-                NEW_CHANNEL_ORDER,
-                TARGET_FS,
-                preprocess_scalp_segment,
+            self.current_recording = (
+                (option or {}).get("display_id")
+                or edf_path.stem
             )
 
-            ch_set = set(self.channel_names_all)
-            if abs(self.fs - TARGET_FS) < 1 and set(NEW_CHANNEL_ORDER).issubset(ch_set):
-                order = [c for c in NEW_CHANNEL_ORDER if c in ch_set]
-                idx = [self.channel_names_all.index(c) for c in order]
-                ref_base = data_v[:, idx].astype(np.float32)
-                self._commit_referential_data(ref_base, order)
-            else:
-                ref_base, channel_names, self.fs = preprocess_scalp_segment(
-                    data_v, list(self.channel_names_all), int(self.fs)
-                )
-                self.total_duration = float(ref_base.shape[0] / self.fs)
-                self._commit_referential_data(ref_base, channel_names)
-            spike_sec = None
-            if option is not None:
-                spike_sec = option.get("spike_time_sec")
+            self._commit_referential_data(data_v, self.channel_names_all)
+            # Local ±7 s clips: review spike activity in 7–8 s (CSV time already
+            # includes SpikeNet delay and is centered in the exported window).
+            self.clip_spike_rel_sec = (
+                CLIP_SPIKE_REGION_START_SEC + CLIP_SPIKE_REGION_END_SEC
+            ) / 2.0
+            spike_sec = option.get("spike_time_sec") if option is not None else None
             if spike_sec is not None:
                 self.clip_spike_abs_sec = float(spike_sec)
-                self.clip_spike_rel_sec = self.clip_spike_abs_sec - self.time_offset_sec
             else:
-                self.clip_spike_rel_sec = self.total_duration / 2.0
-                self.clip_spike_abs_sec = self.time_offset_sec + self.clip_spike_rel_sec
+                self.clip_spike_abs_sec = (
+                    self.time_offset_sec + self.clip_spike_rel_sec
+                )
         except Exception as exc:
             QMessageBox.critical(self, "EDF Load Error", str(exc))
             self.status_bar.showMessage("Load failed.")
@@ -3101,6 +3345,22 @@ class SeizureAnnotationGUI(QMainWindow):
 
         return out
 
+    # ── Common average montage ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _compute_car_montage(
+        data: np.ndarray, channel_names: list[str]
+    ) -> tuple[np.ndarray, list[str]]:
+        """Common average reference: each channel minus the per-sample mean
+        across all channels. Channel set/order is unchanged."""
+        if data.size == 0 or data.shape[1] == 0:
+            return data, list(channel_names)
+        avg_signal = data.mean(axis=1)
+        result = data - avg_signal[:, np.newaxis]
+        if result.shape != data.shape:
+            raise ValueError("The shape of the resulting data doesn't match the input data.")
+        return result.astype(data.dtype), list(channel_names)
+
     # ── Bipolar montage ───────────────────────────────────────────────────────
 
     @staticmethod
@@ -3166,8 +3426,10 @@ class SeizureAnnotationGUI(QMainWindow):
     def _compute_banana_montage(
         data: np.ndarray, channel_names: list[str]
     ) -> tuple[np.ndarray, list[str], set[str]]:
-        """Double-banana order: L temporal → R temporal → L parasagittal → R parasagittal → midline."""
-        return _compute_chain_groups_montage(data, channel_names, BANANA_CHAIN_GROUPS)
+        """Longitudinal bipolar: subtemporal → temporal → parasagittal → central."""
+        return _compute_chain_groups_montage(
+            data, channel_names, BANANA_CHAIN_GROUPS, include_spacers=False
+        )
 
     @staticmethod
     def _compute_ap_bipolar_montage(
@@ -3213,6 +3475,7 @@ class SeizureAnnotationGUI(QMainWindow):
         ref = self._ref_eeg_data_base.astype(np.float32)
         self._ref_eeg_data = ref
         names = self._ref_channel_names
+        self.eeg_data_car, self.channel_names_car = self._compute_car_montage(ref, names)
         self.eeg_data_bipolar, self.channel_names_bipolar = self._compute_bipolar_montage(
             ref, names
         )
@@ -3234,10 +3497,14 @@ class SeizureAnnotationGUI(QMainWindow):
         if self._ref_eeg_data_base is None:
             return
         mode = self._selected_montage_mode()
-        if mode == "referential":
-            self.montage = "referential"
-            self.eeg_data = self._ref_eeg_data
-            self.channel_names_all = list(self._ref_channel_names)
+        if mode == "car":
+            self.montage = "car"
+            if self.eeg_data_car is not None:
+                self.eeg_data = self.eeg_data_car
+                self.channel_names_all = list(self.channel_names_car)
+            else:
+                self.eeg_data = self._ref_eeg_data
+                self.channel_names_all = list(self._ref_channel_names)
         else:
             self.montage = "banana"
             if self.eeg_data_banana is not None:
@@ -3277,6 +3544,7 @@ class SeizureAnnotationGUI(QMainWindow):
         self._apply_active_montage()
         self._populate_channel_list()
         self._rebuild_displayed_channels()
+        self._sync_channel_list_annotation_style()
         self._update_montage_1020_highlights()
 
     def _rebuild_displayed_channels(self):
@@ -3407,6 +3675,52 @@ class SeizureAnnotationGUI(QMainWindow):
             self._add_contact_annotation(contact)
             self.status_bar.showMessage(f"Marked {contact}.")
         self._refresh_annotation_list()
+        if self.clips_mode:
+            self._update_montage_1020_highlights()
+        else:
+            self._redraw_annotation_markers()
+            self._sync_channel_list_annotation_style()
+        self._save_annotations()
+
+    def _is_bipolar_marked(self, pair_name: str) -> bool:
+        pair = pair_name.strip()
+        return any((ann.get("channel") or "").strip() == pair for ann in self.channel_annotations)
+
+    def _remove_bipolar_annotation(self, pair_name: str) -> None:
+        pair = pair_name.strip()
+        self.channel_annotations = [
+            ann for ann in self.channel_annotations
+            if (ann.get("channel") or "").strip() != pair
+        ]
+
+    def _add_bipolar_annotation(self, pair_name: str) -> None:
+        pair = pair_name.strip()
+        if not pair or self._is_bipolar_marked(pair):
+            return
+        clip_start = float(self.time_offset_sec)
+        clip_end = float(self.time_offset_sec + self.total_duration)
+        self.channel_annotations.append({
+            "channel": pair,
+            "label": "marked",
+            "time_sec": clip_start,
+            "end_sec": clip_end,
+        })
+
+    def _toggle_bipolar_annotation(self, pair_name: str) -> None:
+        """Toggle one longitudinal bipolar row (e.g. Fp1-F3)."""
+        if self.eeg_data is None:
+            self.status_bar.showMessage("Load a recording first.")
+            return
+        pair = pair_name.strip()
+        if not pair or pair.startswith("__SPACER_"):
+            return
+        if self._is_bipolar_marked(pair):
+            self._remove_bipolar_annotation(pair)
+            self.status_bar.showMessage(f"Removed {pair}.")
+        else:
+            self._add_bipolar_annotation(pair)
+            self.status_bar.showMessage(f"Marked {pair}.")
+        self._refresh_annotation_list()
         self._redraw_annotation_markers()
         self._sync_channel_list_annotation_style()
         self._save_annotations()
@@ -3490,16 +3804,18 @@ class SeizureAnnotationGUI(QMainWindow):
         return any(self._is_contact_marked(c) for c in self._contacts_from_row_name(row_name))
 
     def _sync_channel_list_annotation_style(self):
-        """Orange text = at least one contact on that trace row is marked."""
+        """Orange text = marked contact (clips: exact list label only)."""
         marked_brush = QBrush(QColor(200, 90, 0))
         default_brush = QBrush()
         self.ch_list.blockSignals(True)
         for i in range(self.ch_list.count()):
             item = self.ch_list.item(i)
             name = item.text()
-            item.setForeground(
-                marked_brush if self._row_has_marked_contact(name) else default_brush
-            )
+            if self.clips_mode:
+                marked = self._is_contact_marked(name)
+            else:
+                marked = self._row_has_marked_contact(name)
+            item.setForeground(marked_brush if marked else default_brush)
         self.ch_list.blockSignals(False)
         self._update_montage_1020_highlights()
 
@@ -3508,6 +3824,8 @@ class SeizureAnnotationGUI(QMainWindow):
         return {ch} if ch else set()
 
     def _displayed_rows_for_contact(self, contact: str) -> list[str]:
+        if self.clips_mode:
+            return []
         return [
             ch for ch in self.displayed_channels
             if not ch.startswith("__SPACER_")
@@ -3648,14 +3966,30 @@ class SeizureAnnotationGUI(QMainWindow):
         # Redraw channel annotation markers
         self._redraw_annotation_markers()
 
-    def _add_spike_window_markers(self, t_view_start: float, t_view_end: float) -> None:
-        """Fixed ±0.5 s band in absolute time (view clips edges when scrolling)."""
-        if self.clip_spike_abs_sec is None:
-            return
+    def _spike_highlight_bounds(self) -> tuple[float, float] | None:
+        """Plot x-axis interval (s) for the red spike band."""
+        if self.clips_mode:
+            return (
+                self.time_offset_sec + CLIP_SPIKE_REGION_START_SEC,
+                self.time_offset_sec + CLIP_SPIKE_REGION_END_SEC,
+            )
+        if self.clip_spike_rel_sec is not None:
+            t0 = self.time_offset_sec + float(self.clip_spike_rel_sec)
+            return (t0 - SPIKE_MARK_HALF_WIDTH_SEC, t0 + SPIKE_MARK_HALF_WIDTH_SEC)
+        if self.clip_spike_abs_sec is not None:
+            spike_t = float(self.clip_spike_abs_sec)
+            return (
+                spike_t - SPIKE_MARK_HALF_WIDTH_SEC,
+                spike_t + SPIKE_MARK_HALF_WIDTH_SEC,
+            )
+        return None
 
-        spike_t = float(self.clip_spike_abs_sec)
-        t_lo = spike_t - SPIKE_MARK_HALF_WIDTH_SEC
-        t_hi = spike_t + SPIKE_MARK_HALF_WIDTH_SEC
+    def _add_spike_window_markers(self, t_view_start: float, t_view_end: float) -> None:
+        """Red shaded band for the spike review window."""
+        bounds = self._spike_highlight_bounds()
+        if bounds is None:
+            return
+        t_lo, t_hi = bounds
         if t_hi < t_view_start or t_lo > t_view_end:
             return
 
@@ -3686,6 +4020,8 @@ class SeizureAnnotationGUI(QMainWindow):
 
     def _redraw_annotation_markers(self):
         """Draw markers / shaded regions and text labels for annotations."""
+        if self.clips_mode:
+            return
         for item in self.annotation_markers:
             self.plot.removeItem(item)
         self.annotation_markers = []
@@ -3801,7 +4137,13 @@ class SeizureAnnotationGUI(QMainWindow):
             return super().eventFilter(obj, event)
 
         etype = event.type()
-        if etype == QEvent.GraphicsSceneMouseDoubleClick and event.button() == Qt.LeftButton:
+        if etype == QEvent.GraphicsSceneMousePress and event.button() == Qt.LeftButton:
+            self._on_mouse_press(event)
+        elif etype == QEvent.GraphicsSceneMouseRelease and event.button() == Qt.LeftButton:
+            self._on_mouse_release(event)
+        elif etype == QEvent.GraphicsSceneMouseDoubleClick and event.button() == Qt.LeftButton:
+            if self.clips_mode:
+                return super().eventFilter(obj, event)
             scene_pos = event.scenePos()
             left_axis = self.plot.getAxis("left")
             if left_axis.sceneBoundingRect().contains(scene_pos):
@@ -3946,7 +4288,7 @@ class SeizureAnnotationGUI(QMainWindow):
             self._drag_region.setFillLevel(y_bot)
 
     def _on_mouse_release(self, event):
-        """Trace row click (no drag): clear annotations for that row's contacts."""
+        """Trace row click (no drag): clear row marks (non-clip mode only)."""
         if self._drag_start_data is None:
             return
 
@@ -3969,6 +4311,8 @@ class SeizureAnnotationGUI(QMainWindow):
         if abs(release_time - start_time) > 0.2:
             return
 
+        if self.clips_mode:
+            return
         ch_name = self.displayed_channels[start_ch_idx]
         self._clear_row_annotations_by_channel(ch_name)
 
@@ -4068,20 +4412,23 @@ class SeizureAnnotationGUI(QMainWindow):
         if 0 <= row < len(self.channel_annotations):
             self.channel_annotations.pop(row)
             self._refresh_annotation_list()
-            self._redraw_annotation_markers()
-            self._sync_channel_list_annotation_style()
+            if self.clips_mode:
+                self._update_montage_1020_highlights()
+            else:
+                self._redraw_annotation_markers()
+                self._sync_channel_list_annotation_style()
             self._save_annotations()
 
     # ── Save / load ───────────────────────────────────────────────────────────
 
     def _current_clip_option(self) -> dict | None:
-        if not self.clips_csv or not self.current_patient:
+        if not self.clips_mode or not self.current_patient:
             return None
         return self.ieeg_selection_options.get(self.current_patient)
 
     def _annotation_path(self) -> Path | None:
         """Clips CSV: annotations/<patient_id>/<ieeg_file_name>_spike_at_<t>.json"""
-        if self.clips_csv:
+        if self.clips_mode:
             opt = self._current_clip_option()
             if opt and opt.get("annotation_relpath"):
                 return ANNOTATIONS_DIR / str(opt["annotation_relpath"])
@@ -4092,7 +4439,7 @@ class SeizureAnnotationGUI(QMainWindow):
 
     def _legacy_annotation_paths(self) -> list[Path]:
         """Load paths from older GUI saves (label + recording, or flat ieeg stem)."""
-        if self.clips_csv and self.current_patient:
+        if self.clips_mode and self.current_patient:
             return self._legacy_annotation_paths_for_clip(self.current_patient)
         paths: list[Path] = []
         if not self.current_patient or not self.current_recording:
@@ -4139,6 +4486,14 @@ class SeizureAnnotationGUI(QMainWindow):
         stem = opt.get("annotation_stem")
         if stem:
             paths.append(ANNOTATIONS_DIR / f"{stem}.json")
+        blinded = str(opt.get("dataset_id", "")).strip()
+        if blinded:
+            paths.append(ANNOTATIONS_DIR / "blinded" / f"{blinded}.json")
+            paths.append(ANNOTATIONS_DIR / f"{blinded}.json")
+        paths.append(ANNOTATIONS_DIR / "blinded" / f"{clip_id}.json")
+        orig = str(opt.get("original_name", "")).strip()
+        if orig:
+            paths.append(ANNOTATIONS_DIR / f"{Path(orig).stem}.json")
         rec = str(opt.get("recording_name", "")).replace(".edf", "")
         display = str(opt.get("ieeg_file_name", ""))
         for label in (
@@ -4151,7 +4506,7 @@ class SeizureAnnotationGUI(QMainWindow):
         return paths
 
     def _patient_has_saved_annotations(self, patient_name: str) -> bool:
-        if self.clips_csv:
+        if self.clips_mode:
             return self._clip_has_saved_annotations(patient_name)
         return any(ANNOTATIONS_DIR.glob(f"{patient_name}_*.json"))
 
@@ -4169,9 +4524,9 @@ class SeizureAnnotationGUI(QMainWindow):
                 continue
             clip_id = self.patient_combo.itemData(i)
             key = str(clip_id) if clip_id else text
-            if self.clips_csv and self._clip_has_saved_annotations(key):
+            if self.clips_mode and self._clip_has_saved_annotations(key):
                 item.setForeground(QBrush(QColor(0, 90, 200)))
-            elif not self.clips_csv and self._patient_has_saved_annotations(text):
+            elif not self.clips_mode and self._patient_has_saved_annotations(text):
                 item.setForeground(QBrush(QColor(0, 90, 200)))
             else:
                 item.setForeground(QBrush(QColor(0, 0, 0)))
@@ -4196,11 +4551,15 @@ class SeizureAnnotationGUI(QMainWindow):
         payload = {
             "ieeg_file_name": opt.get("ieeg_file_name") if opt else None,
             "patient_id": opt.get("patient_id") if opt else self.patient_id_for_annotations,
-            "timestamp_sec": opt.get("spike_time_sec") if opt else None,
+            "timestamp_sec": (
+                opt.get("timestamp_sec") if opt else None
+            ) or (opt.get("spike_time_sec") if opt else None),
             "clip_gui_label": (
                 opt.get("ieeg_file_name") if opt else self.patient_combo.currentText()
             ),
-            "recording": self.current_recording,
+            "recording": (
+                opt.get("display_id") if opt else self.current_recording
+            ),
             "global_types": global_types_out,
             "channel_annotations": clean_channel_annotations,
             "soz_channels": sorted(self.soz_channels),
@@ -4217,7 +4576,7 @@ class SeizureAnnotationGUI(QMainWindow):
         self._remove_current_patient_option()
 
     def _remove_current_patient_option(self):
-        if not (self.ieeg_mode and (self.ieeg_edf_options_csv or self.clips_csv)):
+        if not (self.ieeg_mode and (self.ieeg_edf_options_csv or self.clips_mode)):
             return
         current = self.current_patient
         if not current:
@@ -4231,7 +4590,7 @@ class SeizureAnnotationGUI(QMainWindow):
 
         self.patient_combo.blockSignals(True)
         self.patient_combo.clear()
-        placeholder = "-- Select clip --" if self.clips_csv else "-- Select Patient --"
+        placeholder = "-- Select clip --" if self.clips_mode else "-- Select Patient --"
         self.patient_combo.addItem(placeholder)
         self.patient_combo.addItems(self.patients)
         self.patient_combo.setCurrentIndex(0)
@@ -4245,13 +4604,13 @@ class SeizureAnnotationGUI(QMainWindow):
         if self.patients:
             self.status_bar.showMessage(
                 f"Saved and removed {current}. Select next clip."
-                if self.clips_csv else
+                if self.clips_mode else
                 f"Saved and removed {current}. Select next patient."
             )
         else:
             self.status_bar.showMessage(
                 f"Saved and removed {current}. No clips remaining."
-                if self.clips_csv else
+                if self.clips_mode else
                 f"Saved and removed {current}. No patient options remaining."
             )
 
@@ -4306,6 +4665,13 @@ class SeizureAnnotationGUI(QMainWindow):
 
             self.channel_annotations = payload.get("channel_annotations", [])
             self._normalize_channel_annotations()
+            if self.clips_mode and self.global_types.get("custom_type", "") == "no_spike":
+                if not self._has_no_spike_annotation():
+                    self.channel_annotations.append({
+                        "channel": "(clip)",
+                        "label": "no_spike",
+                    })
+                self.global_types["custom_type"] = ""
 
             saved_soz = payload.get("soz_channels")
             if saved_soz is not None and self.channel_names_all:
@@ -4337,14 +4703,10 @@ class SeizureAnnotationGUI(QMainWindow):
                       self.global_custom_type_edit):
                 w.blockSignals(False)
 
-            if hasattr(self, "btn_ieeg_no_spike"):
+            if hasattr(self, "btn_ieeg_no_spike") and self.btn_ieeg_no_spike.isCheckable():
                 self.btn_ieeg_no_spike.blockSignals(True)
                 self.btn_ieeg_no_spike.setChecked(
                     self.global_types.get("custom_type", "") == "no_spike"
-                )
-                self.btn_ieeg_no_spike.setStyleSheet(
-                    "font-weight: bold; background-color: #ffcc80;"
-                    if self.btn_ieeg_no_spike.isChecked() else ""
                 )
                 self.btn_ieeg_no_spike.blockSignals(False)
 
@@ -4438,6 +4800,14 @@ def main():
             "When a matching file exists, the GUI loads locally instead of iEEG.org."
         ),
     )
+    parser.add_argument(
+        "--clip_scan_dir",
+        default=None,
+        help=(
+            "Directory of clip EDFs to review by scanning the folder directly "
+            "(blinded review, no CSV). Every *.edf becomes a clip option."
+        ),
+    )
     args = parser.parse_args()
 
     app = QApplication(sys.argv)
@@ -4453,7 +4823,15 @@ def main():
         or args.ieeg_edf_options_csv
         or args.clips_csv
     )
-    if ieeg_streaming:
+    # Folder-scan review reads only local clip EDFs (blinded, no CSV/creds).
+    folder_scan = bool(args.clip_scan_dir) and not ieeg_streaming
+    # When clips_csv is paired with a local clip_edf_dir, the GUI can run
+    # purely off pre-exported EDFs and doesn't need iEEG credentials. We only
+    # enforce credentials for the true streaming paths.
+    needs_ieeg_creds = ieeg_streaming and not (
+        args.clips_csv and args.clip_edf_dir
+    )
+    if needs_ieeg_creds:
         if not args.ieeg_username:
             raise SystemExit("Missing --ieeg_username for iEEG mode.")
         if not ieeg_password:
@@ -4461,6 +4839,7 @@ def main():
                 "Missing iEEG password. Provide --ieeg_password or set env var via --ieeg_password_env."
             )
 
+    if ieeg_streaming or folder_scan:
         window = SeizureAnnotationGUI(
             data_dir=None,
             ieeg_dataset_id=args.ieeg_dataset_id,
@@ -4475,6 +4854,7 @@ def main():
             ieeg_edf_options_csv=args.ieeg_edf_options_csv,
             clips_csv=args.clips_csv,
             clip_edf_dir=args.clip_edf_dir,
+            clip_scan_dir=args.clip_scan_dir,
         )
     else:
         window = SeizureAnnotationGUI(data_dir=args.data_dir)

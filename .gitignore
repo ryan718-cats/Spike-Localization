@@ -8,13 +8,8 @@ launch_gui.local.ps1
 **/*password*.bin
 **/*login*.bin
 
-# Review outputs (local clinician data)
-sz-gui/seizure_gui/annotations/
-**/annotations/**/*.json
-
-# Large generated data (optional local cache)
-clip_edfs/
-*.edf
+# Review outputs — keep secrets out of annotation paths if added later
+# (clip review JSON under sz-gui/seizure_gui/annotations/ is tracked)
 
 # Python
 __pycache__/
