@@ -25,6 +25,8 @@ from pathlib import Path
 import numpy as np
 import pyedflib
 
+from clip_timing import CLIP_LEGACY_SYMMETRIC_SHIFT_SEC
+
 KEY_CSV_NAME = "clip_shuffle_key.csv"
 
 # Fixed default so reshuffles are reproducible (same blinded name -> same clip).
@@ -95,6 +97,17 @@ def read_edf_uv(edf_path: Path):
     return data, labels, fs
 
 
+def shift_clip_to_review_band(
+    data: np.ndarray, fs: int, shift_sec: float = CLIP_LEGACY_SYMMETRIC_SHIFT_SEC
+) -> np.ndarray:
+    """Shift symmetric ±7 s clips so SpikeNet time moves from 7.0 s → 7.5 s (7–8 s band)."""
+    n = int(round(float(shift_sec) * fs))
+    if n <= 0 or data.shape[0] <= n:
+        return data
+    pad = np.zeros((n, data.shape[1]), dtype=data.dtype)
+    return np.vstack([pad, data[:-n, :]])
+
+
 def write_clip_edf(out_path: Path, data_uv: np.ndarray, labels: list[str], fs_int: int) -> None:
     """Write (n_samples, n_channels) uV data as an EDF+ file (no flipping)."""
     n_ch = data_uv.shape[1]
@@ -135,6 +148,7 @@ def process_one(edf_path: Path, out_path: Path, *, overwrite: bool) -> str:
     if trimmed_n != n_samples:
         log(f"   trimmed {n_samples} -> {trimmed_n} samples (fs={fs_int})")
     segment = data[:trimmed_n]
+    segment = shift_clip_to_review_band(segment, fs_int)
     segment = segment * -1.0
 
     if not np.isfinite(segment).all():
@@ -275,7 +289,10 @@ def main() -> int:
     else:
         key_path = None
 
-    log(f"Copying {total} clip(s) -> {output_dir} (polarity × −1, no filtering)")
+    log(
+        f"Copying {total} clip(s) -> {output_dir} "
+        f"(+{CLIP_LEGACY_SYMMETRIC_SHIFT_SEC}s time shift for 7–8 s band, polarity × −1, no filtering)"
+    )
     if args.shuffle:
         seed_msg = "random" if args.seed is None else f"seed={args.seed}"
         log(f"Shuffle ON ({seed_msg}); key -> {key_path}")

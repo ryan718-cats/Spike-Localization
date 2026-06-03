@@ -16,7 +16,7 @@ CORE_EEG_CHANNELS = [
     "Fz", "O1", "O2", "P3", "P4", "Pz", "T3", "T4", "T5", "T6",
 ]
 
-CLIP_HALF_WINDOW_SEC = 7.0
+CLIP_HALF_WINDOW_SEC = 7.0  # legacy symmetric ±7 s
 DEFAULT_CLIPS_CSV_NAME = "final_selected_200_events.csv"
 
 
@@ -131,15 +131,20 @@ def fetch_ieeg_window_uv(
     dataset_id: str,
     center_sec: float,
     half_window_sec: float = CLIP_HALF_WINDOW_SEC,
+    *,
+    pre_sec: float | None = None,
+    post_sec: float | None = None,
     channels: list[str] | None = None,
 ) -> tuple[np.ndarray, list[str], float]:
-    """Download ±window scalp EEG; lab preprocess; return (n_samples, n_ch), labels, fs."""
+    """Download scalp EEG window; lab preprocess; return (n_samples, n_ch), labels, fs."""
     from ieeg_load_preprocess import CHANNELS_TO_INCLUDE, load_and_preprocess_window
 
     channels = channels or CHANNELS_TO_INCLUDE
     dataset_id = dataset_id.strip()
-    window_start = max(0.0, float(center_sec) - float(half_window_sec))
-    window_end = float(center_sec) + float(half_window_sec)
+    pre = float(half_window_sec if pre_sec is None else pre_sec)
+    post = float(half_window_sec if post_sec is None else post_sec)
+    window_start = max(0.0, float(center_sec) - pre)
+    window_end = float(center_sec) + post
     if window_end <= window_start:
         raise ValueError(f"Invalid window for {dataset_id} at {center_sec}s")
 

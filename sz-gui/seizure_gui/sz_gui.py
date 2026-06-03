@@ -71,8 +71,8 @@ VISIBLE_SECONDS = 3.0        # visible EEG window (seconds)
 TIME_SCROLL_STEP_SEC = 0.25  # horizontal scroll step (seconds); ←→ and time scrollbar arrows
 SCROLL_TICKS_PER_SEC = 4     # scrollbar resolution (1 tick = TIME_SCROLL_STEP_SEC)
 IEEG_SPIKE_HALF_WINDOW_SEC = 7.0   # ± this many seconds around spike (14 s total)
-CLIP_SPIKE_REGION_START_SEC = 7.0  # highlighted spike window in local ±7 s clips
-CLIP_SPIKE_REGION_END_SEC = 8.0
+CLIP_SPIKE_REGION_START_SEC = 7.0  # spike review band in preprocessed clips
+CLIP_SPIKE_REGION_END_SEC = 8.0    # (CSV time at ~7.5 s after +0.5 s export shift)
 SPIKE_MARK_HALF_WIDTH_SEC = 0.5    # ±0.5 s band when streaming (non-clip) iEEG
 SPIKE_MARK_LINE_COLOR = (220, 40, 40)
 SPIKE_MARK_FILL_COLOR = (255, 180, 180, 70)
@@ -3111,8 +3111,8 @@ class SeizureAnnotationGUI(QMainWindow):
             )
 
             self._commit_referential_data(data_v, self.channel_names_all)
-            # Local ±7 s clips: review spike activity in 7–8 s (CSV time already
-            # includes SpikeNet delay and is centered in the exported window).
+            # Preprocessed clips: symmetric ±7 s source shifted +0.5 s so CSV
+            # timestamp sits at ~7.5 s (within the 7–8 s review band).
             self.clip_spike_rel_sec = (
                 CLIP_SPIKE_REGION_START_SEC + CLIP_SPIKE_REGION_END_SEC
             ) / 2.0

@@ -20,6 +20,7 @@ from pathlib import Path
 import pandas as pd
 from tqdm import tqdm
 
+from clip_timing import CLIP_EXPORT_POST_SEC, CLIP_EXPORT_PRE_SEC
 from ieeg_clip_io import (
     CLIP_HALF_WINDOW_SEC,
     DEFAULT_CLIPS_CSV_NAME,
@@ -129,7 +130,8 @@ def main() -> int:
                 password,
                 opt["dataset_id"],
                 opt["spike_time_sec"],
-                half_window_sec=args.half_window_sec,
+                pre_sec=CLIP_EXPORT_PRE_SEC,
+                post_sec=CLIP_EXPORT_POST_SEC,
             )
             write_clip_edf(edf_path, data_uv, labels, fs)
             meta_path.write_text(json.dumps(sidecar, indent=2), encoding="utf-8")
