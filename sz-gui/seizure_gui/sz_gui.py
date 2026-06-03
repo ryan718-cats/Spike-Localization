@@ -1965,11 +1965,11 @@ class SeizureAnnotationGUI(QMainWindow):
         row1.addWidget(QLabel("Montage:"))
         self.montage_combo = QComboBox()
         self.montage_combo.addItem("Common average", "car")
-        self.montage_combo.addItem("Longitudinal", "banana")
+        self.montage_combo.addItem("Bipolar", "banana")
         self.montage_combo.setCurrentIndex(1)
         self.montage_combo.setToolTip(
             "Common average: each scalp channel minus the mean across all channels. "
-            "Longitudinal: subtemporal → temporal → parasagittal bipolar chains."
+            "Bipolar: subtemporal → temporal → parasagittal chains."
         )
         self.montage_combo.currentIndexChanged.connect(self._on_montage_combo_changed)
         row1.addWidget(self.montage_combo)
