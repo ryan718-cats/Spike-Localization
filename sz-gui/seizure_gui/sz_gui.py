@@ -70,9 +70,14 @@ CHANNEL_SPACING_UV = 300.0   # fixed baseline spacing between channels in µV
 VISIBLE_SECONDS = 3.0        # visible EEG window (seconds)
 TIME_SCROLL_STEP_SEC = 0.25  # horizontal scroll step (seconds); ←→ and time scrollbar arrows
 SCROLL_TICKS_PER_SEC = 4     # scrollbar resolution (1 tick = TIME_SCROLL_STEP_SEC)
-IEEG_SPIKE_HALF_WINDOW_SEC = 7.0   # ± this many seconds around spike (14 s total)
+IEEG_SPIKE_HALF_WINDOW_SEC = 7.0   # ±7 s around spike center (14 s total)
+# CSV timestamp_sec is the SN2 trigger (0.46 crossing); spike center is +0.5 s.
+SPIKENET_TRIGGER_TO_CENTER_SEC = 0.5
+CLIP_SPIKE_CENTER_REL_SEC = (
+    IEEG_SPIKE_HALF_WINDOW_SEC + SPIKENET_TRIGGER_TO_CENTER_SEC
+)  # 7.5 s in preprocessed clips (7.0 s before +0.5 s export shift)
 CLIP_SPIKE_REGION_START_SEC = 7.0  # spike review band in preprocessed clips
-CLIP_SPIKE_REGION_END_SEC = 8.0    # (CSV time at ~7.5 s after +0.5 s export shift)
+CLIP_SPIKE_REGION_END_SEC = 8.0
 SPIKE_MARK_HALF_WIDTH_SEC = 0.5    # ±0.5 s band when streaming (non-clip) iEEG
 SPIKE_MARK_LINE_COLOR = (220, 40, 40)
 SPIKE_MARK_FILL_COLOR = (255, 180, 180, 70)
@@ -3038,18 +3043,23 @@ class SeizureAnnotationGUI(QMainWindow):
                 spike_time = self.ieeg_spike_time_by_dataset.get(dataset_id)
             half = float(IEEG_SPIKE_HALF_WINDOW_SEC)
             if spike_time is not None and not use_flat:
-                window_start_sec = max(0.0, float(spike_time) - half)
-                window_end_sec = float(spike_time) + half
+                trigger_sec = float(spike_time)
+                spike_center_sec = trigger_sec + SPIKENET_TRIGGER_TO_CENTER_SEC
+                # Match clip export: ±7 s around spike center
+                # ([trigger - 6.5, trigger + 7.5] in recording time).
+                window_start_sec = max(0.0, spike_center_sec - half)
+                window_end_sec = spike_center_sec + half
             else:
                 window_start_sec = 0.0
                 window_end_sec = 2.0 * half
+                spike_center_sec = None
 
             window_duration_sec = max(0.0, window_end_sec - window_start_sec)
             self.total_duration = window_duration_sec
             self.time_offset_sec = window_start_sec
-            if spike_time is not None and not use_flat:
-                self.clip_spike_abs_sec = float(spike_time)
-                self.clip_spike_rel_sec = float(spike_time) - window_start_sec
+            if spike_center_sec is not None:
+                self.clip_spike_abs_sec = spike_center_sec
+                self.clip_spike_rel_sec = spike_center_sec - window_start_sec
             else:
                 self.clip_spike_abs_sec = None
                 self.clip_spike_rel_sec = None
@@ -3098,9 +3108,10 @@ class SeizureAnnotationGUI(QMainWindow):
         QApplication.processEvents()
         try:
             raw = mne.io.read_raw_edf(str(edf_path), preload=True, verbose=False)
-            data_v = raw.get_data().T.astype(np.float32)
             self.fs = float(raw.info["sfreq"])
             self.channel_names_all = list(raw.ch_names)
+            raw_uv = raw.get_data().T.astype(np.float64)
+            data_v = self._preprocess(raw_uv, self.fs).astype(np.float32)
             self.total_duration = float(data_v.shape[0] / self.fs)
             self.time_offset_sec = 0.0
             self.ictal_onset = None
@@ -3111,14 +3122,13 @@ class SeizureAnnotationGUI(QMainWindow):
             )
 
             self._commit_referential_data(data_v, self.channel_names_all)
-            # Preprocessed clips: symmetric ±7 s source shifted +0.5 s so CSV
-            # timestamp sits at ~7.5 s (within the 7–8 s review band).
-            self.clip_spike_rel_sec = (
-                CLIP_SPIKE_REGION_START_SEC + CLIP_SPIKE_REGION_END_SEC
-            ) / 2.0
+            # Preprocessed clips: +0.5 s export shift places spike center at 7.5 s (7–8 s band).
+            self.clip_spike_rel_sec = CLIP_SPIKE_CENTER_REL_SEC
             spike_sec = option.get("spike_time_sec") if option is not None else None
             if spike_sec is not None:
-                self.clip_spike_abs_sec = float(spike_sec)
+                self.clip_spike_abs_sec = (
+                    float(spike_sec) + SPIKENET_TRIGGER_TO_CENTER_SEC
+                )
             else:
                 self.clip_spike_abs_sec = (
                     self.time_offset_sec + self.clip_spike_rel_sec
@@ -3315,7 +3325,7 @@ class SeizureAnnotationGUI(QMainWindow):
         seizure-relevant content.
 
         Steps applied per channel:
-          1. 0.5 Hz 4th-order Butterworth high-pass  →  removes DC offset and
+          1. 1 Hz 4th-order Butterworth high-pass  →  removes DC offset and
              slow electrode drift that shift each channel's baseline arbitrarily
              far from zero, which is the main reason raw traces look like
              vertical spikes with no visible waveform.
@@ -3328,7 +3338,7 @@ class SeizureAnnotationGUI(QMainWindow):
         out = data.copy()
 
         nyq = fs / 2.0
-        hp_sos = butter(4, 0.5 / nyq, btype="high", output="sos")
+        hp_sos = butter(4, 1.0 / nyq, btype="high", output="sos")
 
         notch_sos = None
         if nyq > 61:

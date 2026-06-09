@@ -1,15 +1,20 @@
-# Copy local clip EDFs from ./clip_edfs/ to ./clip_edfs_preprocessed/ with no
-# filtering/resampling, but with polarity flipped (× −1) to match lab convention.
+# Build blinded review clips from ./clip_edfs/ → ./clip_edfs_preprocessed/.
 #
-# By default the output clips are shuffled and named from ieeg_file_name +
-# timestamp_sec (e.g. EMU1049_Day08_1_32621.8438.edf). Review order is
-# randomized; clip_shuffle_key.csv records the mapping.
+# Input (clip_edfs/):
+#   - *.edf  (spike_ / no_spike_ / midline_ prefixed exports, 14 s each)
+#   - selected_events_with_criteria.csv  (one row per EDF; source key)
+#
+# Output (clip_edfs_preprocessed/):
+#   - Blinded EDFs named <ieeg_file_name>_<timestamp_sec>.edf (shuffled order)
+#   - clip_shuffle_key.csv  (review_order, output_name, original_name, metadata)
+#
+# Processing: +0.5 s time shift (7–8 s spike band), polarity × −1, no filtering.
 #
 # Usage:
 #   python extract_clip_edfs.py
+#   python extract_clip_edfs.py --overwrite          # replace existing outputs
 #   python extract_clip_edfs.py --seed 42            # reproducible shuffle
 #   python extract_clip_edfs.py --no-shuffle         # keep original names/order
-#   python extract_clip_edfs.py --input-dir clip_edfs --output-dir clip_edfs_preprocessed
 #
 # !pip install pyedflib mne
 
@@ -28,6 +33,7 @@ import pyedflib
 from clip_timing import CLIP_LEGACY_SYMMETRIC_SHIFT_SEC
 
 KEY_CSV_NAME = "clip_shuffle_key.csv"
+INPUT_KEY_CSV_NAME = "selected_events_with_criteria.csv"
 
 # Fixed default so reshuffles are reproducible (same blinded name -> same clip).
 # Pass a different --seed to deliberately re-randomize.
@@ -171,31 +177,94 @@ def process_one(edf_path: Path, out_path: Path, *, overwrite: bool) -> str:
     return "saved"
 
 
-def load_criteria(csv_path: Path) -> tuple[list[str], dict[str, dict]]:
-    """Load the events CSV and index each row by clip EDF basename.
+def criteria_basename(row: dict) -> str | None:
+    """Resolve the source EDF filename for a criteria row."""
+    edf_name = str(row.get("edf_filename", "")).strip()
+    if edf_name:
+        return edf_name if edf_name.lower().endswith(".edf") else f"{edf_name}.edf"
+    sel = str(row.get("selection_type", row.get("clip_type", ""))).strip()
+    ieeg = str(row.get("ieeg_file_name", "")).strip()
+    ts_raw = str(row.get("timestamp_sec", "")).strip()
+    if not (sel and ieeg and ts_raw):
+        return None
+    try:
+        ts = float(ts_raw)
+    except ValueError:
+        return None
+    return f"{sel}_{ieeg}_{ts:.4f}.edf"
 
-    Uses ``edf_filename`` when present; otherwise reconstructs
-    ``<selection_type>_<ieeg_file_name>_<timestamp_sec:.4f>.edf``.
-    """
+
+def load_criteria(csv_path: Path) -> tuple[list[str], dict[str, dict]]:
+    """Load selected_events_with_criteria.csv indexed by source EDF basename."""
     with open(csv_path, newline="", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh)
         columns = list(reader.fieldnames or [])
         by_basename: dict[str, dict] = {}
         for row in reader:
-            edf_name = str(row.get("edf_filename", "")).strip()
-            if edf_name:
-                basename = edf_name if edf_name.lower().endswith(".edf") else f"{edf_name}.edf"
-            else:
-                sel = str(row.get("selection_type", "")).strip()
-                ieeg = str(row.get("ieeg_file_name", "")).strip()
-                ts_raw = str(row.get("timestamp_sec", "")).strip()
-                try:
-                    ts = float(ts_raw)
-                except ValueError:
-                    continue
-                basename = f"{sel}_{ieeg}_{ts:.4f}.edf"
-            by_basename[basename] = dict(row)
+            basename = criteria_basename(row)
+            if basename:
+                by_basename[basename] = dict(row)
     return columns, by_basename
+
+
+def validate_inputs(
+    input_dir: Path,
+    edf_files: list[Path],
+    criteria_by_basename: dict[str, dict],
+) -> None:
+    """Ensure every EDF has criteria metadata and vice versa."""
+    edf_names = {p.name for p in edf_files}
+    csv_names = set(criteria_by_basename)
+    missing_edf = sorted(csv_names - edf_names)
+    missing_csv = sorted(edf_names - csv_names)
+    errors: list[str] = []
+    if missing_edf:
+        errors.append(
+            f"{len(missing_edf)} CSV row(s) have no matching EDF in {input_dir} "
+            f"(e.g. {missing_edf[0]})"
+        )
+    if missing_csv:
+        errors.append(
+            f"{len(missing_csv)} EDF(s) in {input_dir} are missing from the key CSV "
+            f"(e.g. {missing_csv[0]})"
+        )
+    if errors:
+        raise SystemExit("\n".join(errors))
+
+
+def build_shuffle_key_row(
+    review_order: int,
+    edf_path: Path,
+    out_name: str,
+    criteria_row: dict,
+    criteria_columns: list[str],
+) -> dict:
+    clip_type = (
+        (criteria_row.get("clip_type") or criteria_row.get("selection_type") or "")
+        .strip()
+        or clip_type_from_name(edf_path.name)
+    )
+    key_row: dict = {
+        "review_order": review_order,
+        "output_name": out_name,
+        "original_name": edf_path.name,
+        "clip_type": clip_type,
+    }
+    for col in criteria_columns:
+        key_row[col] = criteria_row.get(col, "")
+    if not str(key_row.get("clip_type", "")).strip():
+        key_row["clip_type"] = clip_type
+    if not str(key_row.get("selection_type", "")).strip() and clip_type:
+        key_row["selection_type"] = clip_type
+    return key_row
+
+
+def clear_output_clips(output_dir: Path) -> None:
+    for stale in output_dir.glob("*.edf"):
+        stale.unlink()
+    key_path = output_dir / KEY_CSV_NAME
+    if key_path.is_file():
+        key_path.unlink()
 
 
 def main() -> int:
@@ -218,9 +287,8 @@ def main() -> int:
     parser.add_argument(
         "--criteria-csv",
         type=Path,
-        default=here / "selected_events_with_criteria.csv",
-        help="CSV of per-event detail to merge into the shuffle key "
-             "(default: ./selected_events_with_criteria.csv).",
+        default=None,
+        help=f"Source key CSV (default: <input-dir>/{INPUT_KEY_CSV_NAME}).",
     )
     parser.add_argument(
         "--no-shuffle",
@@ -245,26 +313,29 @@ def main() -> int:
 
     input_dir: Path = args.input_dir
     output_dir: Path = args.output_dir
+    if args.criteria_csv is None:
+        args.criteria_csv = input_dir / INPUT_KEY_CSV_NAME
 
     if not input_dir.is_dir():
         sys.exit(f"Input directory not found: {input_dir}")
+    if not args.criteria_csv.is_file():
+        sys.exit(
+            f"Key CSV not found: {args.criteria_csv}\n"
+            f"Expected {INPUT_KEY_CSV_NAME} inside {input_dir}."
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load per-event criteria to enrich the shuffle key.
-    criteria_columns: list[str] = []
-    criteria_by_basename: dict[str, dict] = {}
-    if args.criteria_csv and args.criteria_csv.is_file():
-        criteria_columns, criteria_by_basename = load_criteria(args.criteria_csv)
-        log(f"Loaded criteria for {len(criteria_by_basename)} events "
-            f"from {args.criteria_csv.name}")
-    else:
-        log(f"WARN: criteria CSV not found ({args.criteria_csv}); "
-            f"key will omit event detail.")
+    criteria_columns, criteria_by_basename = load_criteria(args.criteria_csv)
+    log(
+        f"Loaded {len(criteria_by_basename)} event(s) from "
+        f"{args.criteria_csv.name}"
+    )
 
     edf_files = sorted(p for p in input_dir.glob("*.edf") if p.is_file())
     total = len(edf_files)
     if total == 0:
         sys.exit(f"No .edf files found in {input_dir}")
+    validate_inputs(input_dir, edf_files, criteria_by_basename)
 
     # Build (source -> output name). When shuffling, only review order changes.
     sources = list(edf_files)
@@ -277,17 +348,14 @@ def main() -> int:
         )
         for src in sources
     ]
-    if args.shuffle:
-        key_path = output_dir / KEY_CSV_NAME
-        if key_path.exists() and not args.overwrite:
-            sys.exit(
-                f"{key_path} already exists. Re-run with --overwrite to reshuffle, "
-                f"or use --no-shuffle."
-            )
-        for stale in output_dir.glob("*.edf"):
-            stale.unlink()
-    else:
-        key_path = None
+    key_path = output_dir / KEY_CSV_NAME if args.shuffle else None
+    if args.shuffle and key_path is not None and key_path.exists() and not args.overwrite:
+        sys.exit(
+            f"{key_path} already exists. Re-run with --overwrite to reshuffle, "
+            f"or use --no-shuffle."
+        )
+    if args.overwrite and args.shuffle:
+        clear_output_clips(output_dir)
 
     log(
         f"Copying {total} clip(s) -> {output_dir} "
@@ -322,16 +390,12 @@ def main() -> int:
             log(f"[{i:>3}/{total}] saved {out_name} <- {edf_path.name} "
                 f"({size_kb:.1f} KB, {clip_dt:.1f}s, batch {elapsed/60:.1f} min)")
 
-        criteria_row = criteria_by_basename.get(edf_path.name, {})
-        key_row: dict = {
-            "review_order": i,
-            "output_name": out_name,
-            "original_name": edf_path.name,
-            "clip_type": clip_type_from_name(edf_path.name),
-        }
-        for col in criteria_columns:
-            key_row[col] = criteria_row.get(col, "")
-        key_rows.append(key_row)
+        criteria_row = criteria_by_basename[edf_path.name]
+        key_rows.append(
+            build_shuffle_key_row(
+                i, edf_path, out_name, criteria_row, criteria_columns
+            )
+        )
 
     if key_path is not None and key_rows:
         reserved = {"review_order", "output_name", "original_name", "clip_type"}
