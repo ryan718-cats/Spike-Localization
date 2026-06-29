@@ -33,7 +33,40 @@ import pyedflib
 from clip_timing import CLIP_LEGACY_SYMMETRIC_SHIFT_SEC
 
 KEY_CSV_NAME = "clip_shuffle_key.csv"
-INPUT_KEY_CSV_NAME = "selected_events_with_criteria.csv"
+INPUT_KEY_CSV_CANDIDATES = (
+    "selected_events_with_criteria.csv",
+    "generalized_selected_events_with_criteria.csv",
+)
+EXTRA_CRITERIA_GLOB = "*localizations*.csv"
+
+
+def resolve_input_key_csv(input_dir: Path) -> Path | None:
+    """First matching key CSV in *input_dir* (prefers selected_events name)."""
+    for name in INPUT_KEY_CSV_CANDIDATES:
+        path = input_dir / name
+        if path.is_file():
+            return path
+    return None
+
+
+def discover_criteria_csvs(input_dir: Path) -> list[Path]:
+    """All criteria CSVs under *input_dir* (top-level key files + *localizations*)."""
+    found: list[Path] = []
+    seen: set[Path] = set()
+    for name in INPUT_KEY_CSV_CANDIDATES:
+        path = input_dir / name
+        if path.is_file():
+            resolved = path.resolve()
+            if resolved not in seen:
+                found.append(path)
+                seen.add(resolved)
+    for path in sorted(input_dir.rglob(EXTRA_CRITERIA_GLOB)):
+        if path.is_file():
+            resolved = path.resolve()
+            if resolved not in seen:
+                found.append(path)
+                seen.add(resolved)
+    return found
 
 # Fixed default so reshuffles are reproducible (same blinded name -> same clip).
 # Pass a different --seed to deliberately re-randomize.
@@ -46,20 +79,60 @@ def _format_clip_timestamp_sec(timestamp_sec: float) -> str:
 
 def output_name_for_clip(edf_path: Path, criteria_row: dict) -> str:
     """Output EDF basename from criteria or source filename (EMU…_time.edf)."""
-    ieeg = (criteria_row.get("ieeg_file_name") or "").strip()
-    ts_raw = (criteria_row.get("timestamp_sec") or "").strip()
+    row = normalize_criteria_row(criteria_row)
+    ieeg = (row.get("ieeg_file_name") or "").strip()
+    ts_raw = (row.get("timestamp_sec") or "").strip()
     if ieeg and ts_raw:
         return f"{ieeg}_{_format_clip_timestamp_sec(float(ts_raw))}.edf"
     stem = edf_path.stem
-    for prefix in ("spike_", "no_spike_", "midline_"):
+    for prefix in ("spike_", "no_spike_", "midline_", "left_frontal_", "right_frontal_"):
         if stem.lower().startswith(prefix):
             return f"{stem[len(prefix):]}.edf"
     return edf_path.name
 
 
+def normalize_criteria_row(row: dict) -> dict:
+    """Map frontal / generalized CSV columns to a common shuffle-key shape."""
+    out = dict(row)
+    ieeg = (out.get("ieeg_file_name") or out.get("ieeg_file") or "").strip()
+    if ieeg:
+        out["ieeg_file_name"] = ieeg
+    ts_raw = (out.get("timestamp_sec") or out.get("spike_time_sec") or "").strip()
+    if ts_raw:
+        out["timestamp_sec"] = ts_raw
+    prob = out.get("spikenet2_probability") or out.get("sn2_prob")
+    if prob not in (None, "") and not str(out.get("spikenet2_probability", "")).strip():
+        out["spikenet2_probability"] = prob
+    loc = (out.get("localized_channel") or out.get("best_channel_1") or "").strip()
+    if loc and not str(out.get("localized_channel", "")).strip():
+        out["localized_channel"] = loc
+    sel = (out.get("selection_type") or out.get("clip_type") or "").strip()
+    if not sel:
+        sel = selection_type_from_name(str(out.get("edf_filename", "")))
+    if sel:
+        out["selection_type"] = sel
+        if not str(out.get("clip_type", "")).strip():
+            out["clip_type"] = sel
+    return out
+
+
+def selection_type_from_name(name: str) -> str:
+    """Recover selection label from source EDF filename prefix."""
+    stem = Path(name).name.lower()
+    if stem.startswith("left_frontal_"):
+        return "left_frontal"
+    if stem.startswith("right_frontal_"):
+        return "right_frontal"
+    return clip_type_from_name(name)
+
+
 def clip_type_from_name(name: str) -> str:
     """Recover the clip label encoded in the source filename prefix."""
     stem = name.lower()
+    if stem.startswith("left_frontal_"):
+        return "left_frontal"
+    if stem.startswith("right_frontal_"):
+        return "right_frontal"
     if stem.startswith("no_spike_"):
         return "no_spike"
     if stem.startswith("spike_"):
@@ -179,6 +252,7 @@ def process_one(edf_path: Path, out_path: Path, *, overwrite: bool) -> str:
 
 def criteria_basename(row: dict) -> str | None:
     """Resolve the source EDF filename for a criteria row."""
+    row = normalize_criteria_row(row)
     edf_name = str(row.get("edf_filename", "")).strip()
     if edf_name:
         return edf_name if edf_name.lower().endswith(".edf") else f"{edf_name}.edf"
@@ -194,16 +268,35 @@ def criteria_basename(row: dict) -> str | None:
     return f"{sel}_{ieeg}_{ts:.4f}.edf"
 
 
-def load_criteria(csv_path: Path) -> tuple[list[str], dict[str, dict]]:
-    """Load selected_events_with_criteria.csv indexed by source EDF basename."""
-    with open(csv_path, newline="", encoding="utf-8-sig") as fh:
-        reader = csv.DictReader(fh)
-        columns = list(reader.fieldnames or [])
-        by_basename: dict[str, dict] = {}
-        for row in reader:
-            basename = criteria_basename(row)
-            if basename:
-                by_basename[basename] = dict(row)
+def load_criteria(csv_paths: list[Path]) -> tuple[list[str], dict[str, dict]]:
+    """Load one or more criteria CSVs indexed by source EDF basename."""
+    columns: list[str] = []
+    seen_cols: set[str] = set()
+    by_basename: dict[str, dict] = {}
+    for csv_path in csv_paths:
+        with open(csv_path, newline="", encoding="utf-8-sig") as fh:
+            reader = csv.DictReader(fh)
+            for col in reader.fieldnames or []:
+                if col not in seen_cols:
+                    columns.append(col)
+                    seen_cols.add(col)
+            for row in reader:
+                normalized = normalize_criteria_row(row)
+                basename = criteria_basename(normalized)
+                if basename:
+                    by_basename[basename] = normalized
+    # Ensure canonical columns appear in shuffle key even if only one CSV had them.
+    for col in (
+        "ieeg_file_name",
+        "timestamp_sec",
+        "spikenet2_probability",
+        "localized_channel",
+        "selection_type",
+        "clip_type",
+    ):
+        if col not in seen_cols:
+            columns.append(col)
+            seen_cols.add(col)
     return columns, by_basename
 
 
@@ -239,6 +332,7 @@ def build_shuffle_key_row(
     criteria_row: dict,
     criteria_columns: list[str],
 ) -> dict:
+    criteria_row = normalize_criteria_row(criteria_row)
     clip_type = (
         (criteria_row.get("clip_type") or criteria_row.get("selection_type") or "")
         .strip()
@@ -287,8 +381,9 @@ def main() -> int:
     parser.add_argument(
         "--criteria-csv",
         type=Path,
+        action="append",
         default=None,
-        help=f"Source key CSV (default: <input-dir>/{INPUT_KEY_CSV_NAME}).",
+        help="Source key CSV (repeatable). Default: all criteria/localization CSVs under input dir.",
     )
     parser.add_argument(
         "--no-shuffle",
@@ -313,25 +408,28 @@ def main() -> int:
 
     input_dir: Path = args.input_dir
     output_dir: Path = args.output_dir
-    if args.criteria_csv is None:
-        args.criteria_csv = input_dir / INPUT_KEY_CSV_NAME
+    if args.criteria_csv:
+        criteria_csvs = list(args.criteria_csv)
+    else:
+        criteria_csvs = discover_criteria_csvs(input_dir)
 
     if not input_dir.is_dir():
         sys.exit(f"Input directory not found: {input_dir}")
-    if not args.criteria_csv.is_file():
+    if not criteria_csvs:
         sys.exit(
-            f"Key CSV not found: {args.criteria_csv}\n"
-            f"Expected {INPUT_KEY_CSV_NAME} inside {input_dir}."
+            f"No key CSV found under {input_dir}.\n"
+            f"Expected one of: {', '.join(INPUT_KEY_CSV_CANDIDATES)} "
+            f"or {EXTRA_CRITERIA_GLOB} in subfolders."
         )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    criteria_columns, criteria_by_basename = load_criteria(args.criteria_csv)
+    criteria_columns, criteria_by_basename = load_criteria(criteria_csvs)
     log(
         f"Loaded {len(criteria_by_basename)} event(s) from "
-        f"{args.criteria_csv.name}"
+        + ", ".join(p.name for p in criteria_csvs)
     )
 
-    edf_files = sorted(p for p in input_dir.glob("*.edf") if p.is_file())
+    edf_files = sorted(p for p in input_dir.rglob("*.edf") if p.is_file())
     total = len(edf_files)
     if total == 0:
         sys.exit(f"No .edf files found in {input_dir}")

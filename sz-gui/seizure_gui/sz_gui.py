@@ -79,6 +79,11 @@ CLIP_SPIKE_CENTER_REL_SEC = (
 CLIP_SPIKE_REGION_START_SEC = 7.0  # spike review band in preprocessed clips
 CLIP_SPIKE_REGION_END_SEC = 8.0
 SPIKE_MARK_HALF_WIDTH_SEC = 0.5    # ±0.5 s band when streaming (non-clip) iEEG
+CLIPS_USER_SPIKE_LINE_COLOR = (200, 60, 200)
+CLIPS_ACTIVE_SPIKE_LINE_COLOR = (120, 0, 160)
+SPIKE_CLICK_HIT_TOLERANCE_SEC = 0.2  # plot click near marker removes that spike
+# Optional folder-scan filter (None = all clips). Example: frozenset({"left_frontal", "right_frontal"})
+CLIP_FOLDER_TYPES_FILTER: frozenset[str] | None = None
 SPIKE_MARK_LINE_COLOR = (220, 40, 40)
 SPIKE_MARK_FILL_COLOR = (255, 180, 180, 70)
 GAIN_STEP = 1.5              # multiply/divide per ↑↓ key press
@@ -1565,6 +1570,25 @@ def clip_annotation_stem(ieeg_file_name: str, timestamp_sec: float) -> str:
     return f"{clip_display_stem(ieeg_file_name, timestamp_sec)}.edf"
 
 
+def clip_folder_type(path: Path, row: dict | None) -> str:
+    """Resolve left/right frontal vs generalized type from shuffle row or filename."""
+    if row:
+        ct = (row.get("clip_type") or row.get("selection_type") or "").strip().lower()
+        if ct:
+            return ct
+        orig = (row.get("original_name") or "").strip().lower()
+        if orig.startswith("left_frontal_"):
+            return "left_frontal"
+        if orig.startswith("right_frontal_"):
+            return "right_frontal"
+    name = path.name.lower()
+    if name.startswith("left_frontal_"):
+        return "left_frontal"
+    if name.startswith("right_frontal_"):
+        return "right_frontal"
+    return ""
+
+
 def load_clip_shuffle_key(folder: Path) -> dict[str, dict]:
     """Map clip file stem (clip_001 or EMU…_timestamp) → shuffle-key row."""
     key_path = folder / "clip_shuffle_key.csv"
@@ -1576,8 +1600,8 @@ def load_clip_shuffle_key(folder: Path) -> dict[str, dict]:
             out = (row.get("output_name") or "").strip()
             if out:
                 by_stem[Path(out).stem] = row
-            ieeg = (row.get("ieeg_file_name") or "").strip()
-            ts_raw = (row.get("timestamp_sec") or "").strip()
+            ieeg = (row.get("ieeg_file_name") or row.get("ieeg_file") or "").strip()
+            ts_raw = (row.get("timestamp_sec") or row.get("spike_time_sec") or "").strip()
             if ieeg and ts_raw:
                 by_stem[clip_display_stem(ieeg, float(ts_raw))] = row
     return by_stem
@@ -1846,10 +1870,15 @@ class SeizureAnnotationGUI(QMainWindow):
         }
         # channel-level: list of {"channel": str, "time_sec": float, "types": {dict}}
         self.channel_annotations: list[dict] = []
+        # clips review: ordered localizations per user-marked spike time
+        self.spike_events: list[dict] = []  # {"time_sec": float, "channels": [str, ...]}
+        self._active_spike_event_idx: int | None = None
+        self._annot_list_meta: list[tuple[str, int | None, int | None]] = []
 
         # ── plot items ────────────────────────────────────────────────────────
         self.trace_items: list[pg.PlotDataItem] = []
         self.annotation_markers: list = []           # ScatterPlot, LinearRegion, TextItem
+        self._clips_spike_marker_items: list = []    # user spike lines (lightweight refresh)
         self.ictal_region: pg.LinearRegionItem | None = None
 
         # ── montage ───────────────────────────────────────────────────────────
@@ -2095,9 +2124,11 @@ class SeizureAnnotationGUI(QMainWindow):
         rpl.addWidget(QLabel("<b>Channel Annotations</b>"))
         self.annot_list = QListWidget()
         self.annot_list.setMaximumHeight(200)
+        self.annot_list.itemClicked.connect(self._on_annotation_list_clicked)
         self.annot_list.itemDoubleClicked.connect(self._remove_channel_annotation)
         rpl.addWidget(self.annot_list)
-        rpl.addWidget(QLabel("<i>Double-click annotation to delete</i>"))
+        self.annot_list_help_label = QLabel("<i>Double-click annotation to delete</i>")
+        rpl.addWidget(self.annot_list_help_label)
         rpl.addStretch(1)
 
         self.montage_1020_title_label = QLabel(
@@ -2537,10 +2568,24 @@ class SeizureAnnotationGUI(QMainWindow):
             (p for p in folder.glob("*.edf") if p.is_file()),
             key=_review_order,
         )
+        if CLIP_FOLDER_TYPES_FILTER is not None:
+            edf_files = [
+                p
+                for p in edf_files
+                if clip_folder_type(p, shuffle.get(p.stem)) in CLIP_FOLDER_TYPES_FILTER
+            ]
         if not edf_files:
-            QMessageBox.critical(
-                self, "Clip Folder Error", f"No .edf files found in {folder}"
-            )
+            if CLIP_FOLDER_TYPES_FILTER is not None:
+                types_label = ", ".join(sorted(CLIP_FOLDER_TYPES_FILTER))
+                QMessageBox.critical(
+                    self,
+                    "Clip Folder Error",
+                    f"No .edf files matching clip types [{types_label}] in {folder}",
+                )
+            else:
+                QMessageBox.critical(
+                    self, "Clip Folder Error", f"No .edf files found in {folder}"
+                )
             return
 
         clip_ids: list[str] = []
@@ -2557,8 +2602,10 @@ class SeizureAnnotationGUI(QMainWindow):
             original_name = path.name
             review_order = i + 1
             if row:
-                ieeg_name = (row.get("ieeg_file_name") or file_stem).strip()
-                ts_raw = (row.get("timestamp_sec") or "").strip()
+                ieeg_name = (
+                    row.get("ieeg_file_name") or row.get("ieeg_file") or file_stem
+                ).strip()
+                ts_raw = (row.get("timestamp_sec") or row.get("spike_time_sec") or "").strip()
                 if ts_raw:
                     ts = float(ts_raw)
                 clip_type = (row.get("clip_type") or row.get("selection_type") or "").strip()
@@ -2628,9 +2675,13 @@ class SeizureAnnotationGUI(QMainWindow):
         self.recording_combo.blockSignals(False)
 
         self._configure_clips_review_ui()
+        filter_note = ""
+        if CLIP_FOLDER_TYPES_FILTER is not None:
+            filter_note = f" ({', '.join(sorted(CLIP_FOLDER_TYPES_FILTER))} only)"
         self.status_bar.showMessage(
-            f"Loaded {len(clip_ids)} clips from folder {folder}. "
-            "10–20 map: click contacts to mark. Spike region 7–8 s (red band)."
+            f"Loaded {len(clip_ids)} clips from folder {folder}{filter_note}. "
+            "Plot click = new spike; click spike marker/row to remove. "
+            "Then 10–20 map for ranked channels."
         )
         self._apply_active_montage()
 
@@ -2647,13 +2698,17 @@ class SeizureAnnotationGUI(QMainWindow):
         self._clips_review_ui_configured = True
         if hasattr(self, "clips_channel_help_label"):
             self.clips_channel_help_label.setText(
-                "<i>Uncheck to hide traces. 10–20 map: click contacts to mark "
-                "(saved in list only). Spike window 7–8 s shown in red.</i>"
+                "<i>1) Click plot → spike time. 2) Click 10–20 contacts (ranked). "
+                "3) Click plot again for another spike. Click spike line/row to remove.</i>"
+            )
+        if hasattr(self, "annot_list_help_label"):
+            self.annot_list_help_label.setText(
+                "<i>Click spike or channel row to remove.</i>"
             )
         if self.ieeg_mode:
             self.status_bar.showMessage(
-                "10–20 map: click contacts to mark (auto-saved). "
-                "Spike region 7–8 s.  ↑↓ amplitude.  ←→ scroll time."
+                "Plot click = new spike; click spike marker/row to remove. "
+                "Then 10–20 map (ranked). ↑↓ amplitude. ←→ scroll."
             )
 
     def _update_clip_info_label(self, label: str | None):
@@ -2781,12 +2836,17 @@ class SeizureAnnotationGUI(QMainWindow):
             ]
             self.status_bar.showMessage("Removed no spike mark.")
         else:
-            self.channel_annotations.append({
+            self.spike_events = []
+            self._active_spike_event_idx = None
+            self.channel_annotations = [{
                 "channel": "(clip)",
                 "label": "no_spike",
-            })
+            }]
             self.status_bar.showMessage("Marked no spike.")
         self._refresh_annotation_list()
+        if self.clips_mode:
+            self._update_montage_1020_highlights()
+            self._refresh_clips_spike_markers()
         self._save_annotations()
 
     def _on_no_spike_clicked(self) -> None:
@@ -2966,6 +3026,9 @@ class SeizureAnnotationGUI(QMainWindow):
             "pattern": "(none)", "modifier": "None", "custom_type": "",
         }
         self.channel_annotations = []
+        self.spike_events = []
+        self._active_spike_event_idx = None
+        self._annot_list_meta = []
         self._reset_global_widgets()
         self._refresh_annotation_list()
         if hasattr(self, "montage_1020_label"):
@@ -3183,6 +3246,9 @@ class SeizureAnnotationGUI(QMainWindow):
             "pattern": "(none)", "modifier": "None", "custom_type": "",
         }
         self.channel_annotations = []
+        self.spike_events = []
+        self._active_spike_event_idx = None
+        self._annot_list_meta = []
         self._reset_global_widgets()
         self._refresh_annotation_list()
         self._configure_time_scroll()
@@ -3295,6 +3361,9 @@ class SeizureAnnotationGUI(QMainWindow):
             "pattern": "(none)", "modifier": "None", "custom_type": "",
         }
         self.channel_annotations = []
+        self.spike_events = []
+        self._active_spike_event_idx = None
+        self._annot_list_meta = []
         self._reset_global_widgets()
         self._refresh_annotation_list()
         self._set_gain(self._auto_gain())
@@ -3651,7 +3720,235 @@ class SeizureAnnotationGUI(QMainWindow):
             return out
         return [row_name.strip()]
 
+    def _clips_spike_workflow_enabled(self) -> bool:
+        return self.clips_mode and not self._has_no_spike_annotation()
+
+    def _clip_time_bounds(self) -> tuple[float, float]:
+        start = float(self.time_offset_sec)
+        end = float(self.time_offset_sec + self.total_duration)
+        return start, end
+
+    def _clamp_clip_time(self, time_sec: float) -> float:
+        t0, t1 = self._clip_time_bounds()
+        return max(t0, min(t1, float(time_sec)))
+
+    def _find_spike_event_at_time(self, time_sec: float) -> int | None:
+        best_idx: int | None = None
+        best_dist = SPIKE_CLICK_HIT_TOLERANCE_SEC
+        for i, ev in enumerate(self.spike_events):
+            dist = abs(float(ev["time_sec"]) - float(time_sec))
+            if dist <= best_dist and (best_idx is None or dist < best_dist):
+                best_dist = dist
+                best_idx = i
+        return best_idx
+
+    def _spike_idx_at_scene_pos(self, scene_pos) -> int | None:
+        """Hit-test spike marker line/label on the plot."""
+        for item in self.plot.scene().items(scene_pos):
+            idx = getattr(item, "_spike_event_idx", None)
+            if idx is not None:
+                return int(idx)
+            parent = item.parentItem()
+            while parent is not None:
+                idx = getattr(parent, "_spike_event_idx", None)
+                if idx is not None:
+                    return int(idx)
+                parent = parent.parentItem()
+        return None
+
+    def _on_clips_plot_click(self, time_sec: float, scene_pos) -> None:
+        """Click empty plot → new spike; click existing spike marker → remove."""
+        idx = self._spike_idx_at_scene_pos(scene_pos)
+        if idx is None:
+            idx = self._find_spike_event_at_time(time_sec)
+        if idx is not None:
+            self._remove_spike_event(idx)
+        else:
+            self._add_spike_event_at_time(time_sec)
+
+    def _add_spike_event_at_time(self, time_sec: float) -> None:
+        """Each plot click starts a new spike; channel picks apply to that spike only."""
+        if not self._clips_spike_workflow_enabled():
+            return
+        if self.eeg_data is None:
+            self.status_bar.showMessage("Load a recording first.")
+            return
+
+        t = self._clamp_clip_time(time_sec)
+        self.spike_events.append({"time_sec": t, "channels": []})
+        self._active_spike_event_idx = len(self.spike_events) - 1
+        self._refresh_annotation_list()
+        self._sync_channel_list_annotation_style()
+        self._refresh_clips_spike_markers()
+        n = len(self.spike_events)
+        self.status_bar.showMessage(
+            f"Spike {n} @ {t:.3f} s — pick 10–20 contacts (ranked). "
+            f"Click spike marker/row to remove."
+        )
+        self._save_annotations()
+
+    def _remove_spike_event(self, spike_idx: int) -> None:
+        if not (0 <= spike_idx < len(self.spike_events)):
+            return
+        removed_t = float(self.spike_events[spike_idx]["time_sec"])
+        self.spike_events.pop(spike_idx)
+        if self._active_spike_event_idx == spike_idx:
+            self._active_spike_event_idx = (
+                min(spike_idx, len(self.spike_events) - 1)
+                if self.spike_events else None
+            )
+        elif (
+            self._active_spike_event_idx is not None
+            and self._active_spike_event_idx > spike_idx
+        ):
+            self._active_spike_event_idx -= 1
+        self._refresh_annotation_list()
+        self._sync_channel_list_annotation_style()
+        self._refresh_clips_spike_markers()
+        self.status_bar.showMessage(f"Removed spike @ {removed_t:.3f} s.")
+        self._save_annotations()
+
+    def _remove_channel_from_spike_event(self, spike_idx: int, channel_idx: int) -> None:
+        if not (0 <= spike_idx < len(self.spike_events)):
+            return
+        channels = self.spike_events[spike_idx].get("channels") or []
+        if not (0 <= channel_idx < len(channels)):
+            return
+        removed = channels.pop(channel_idx)
+        self._refresh_annotation_list()
+        self._sync_channel_list_annotation_style()
+        self._refresh_clips_spike_markers()
+        self.status_bar.showMessage(f"Removed {removed} from spike #{spike_idx + 1}.")
+        self._save_annotations()
+
+    def _active_spike_event(self) -> dict | None:
+        idx = self._active_spike_event_idx
+        if idx is None or not (0 <= idx < len(self.spike_events)):
+            return None
+        return self.spike_events[idx]
+
+    def _contact_in_active_spike(self, contact: str) -> bool:
+        ev = self._active_spike_event()
+        if ev is None:
+            return False
+        return any(
+            self._ten20_contact_equivalent(ch, contact)
+            for ch in (ev.get("channels") or [])
+        )
+
+    def _contact_rank_in_active_spike(self, contact: str) -> int | None:
+        ev = self._active_spike_event()
+        if ev is None:
+            return None
+        for i, ch in enumerate(ev.get("channels") or []):
+            if self._ten20_contact_equivalent(ch, contact):
+                return i + 1
+        return None
+
+    def _set_active_spike_event(self, idx: int | None) -> None:
+        """Switch active spike (annotation list only; plot click always adds new)."""
+        if idx is not None and not (0 <= idx < len(self.spike_events)):
+            idx = None
+        self._active_spike_event_idx = idx
+        self._refresh_annotation_list()
+        self._sync_channel_list_annotation_style()
+        self._refresh_clips_spike_markers()
+
+    def _add_channel_to_active_spike(self, contact: str) -> None:
+        if not self._clips_spike_workflow_enabled():
+            self._toggle_contact_annotation(contact)
+            return
+        if self.eeg_data is None:
+            self.status_bar.showMessage("Load a recording first.")
+            return
+        ev = self._active_spike_event()
+        if ev is None:
+            self.status_bar.showMessage(
+                "Click anywhere on the plot first, then pick channels."
+            )
+            return
+
+        contact = contact.strip()
+        channels: list[str] = ev.setdefault("channels", [])
+        for i, ch in enumerate(channels):
+            if self._ten20_contact_equivalent(ch, contact):
+                removed = channels.pop(i)
+                self._refresh_annotation_list()
+                self._sync_channel_list_annotation_style()
+                self._refresh_clips_spike_markers()
+                self.status_bar.showMessage(f"Removed {removed} from spike ranking.")
+                self._save_annotations()
+                return
+
+        channels.append(contact)
+        rank = len(channels)
+        self._refresh_annotation_list()
+        self._sync_channel_list_annotation_style()
+        self._refresh_clips_spike_markers()
+        self.status_bar.showMessage(
+            f"#{rank} {contact} @ {float(ev['time_sec']):.3f} s "
+            f"(most likely first)."
+        )
+        self._save_annotations()
+
+    def _spike_events_from_legacy_annotations(self, anns: list[dict]) -> list[dict]:
+        """Rebuild spike_events from flat channel_annotations (pre-workflow saves)."""
+        grouped: dict[float, list[tuple[int, str]]] = {}
+        default_t = (
+            float(self.clip_spike_rel_sec)
+            if self.clip_spike_rel_sec is not None
+            else CLIP_SPIKE_CENTER_REL_SEC
+        )
+        for ann in anns:
+            label = (ann.get("label") or "").strip().lower()
+            if label == "no_spike":
+                continue
+            ch = (ann.get("channel") or "").strip()
+            if not ch or ch == "(clip)":
+                continue
+            t_raw = ann.get("time_sec")
+            t = float(t_raw) if t_raw is not None else default_t
+            rank_raw = ann.get("rank")
+            rank = int(rank_raw) if rank_raw is not None else None
+            if rank is None and label.startswith("rank_"):
+                try:
+                    rank = int(label.split("_", 1)[1])
+                except ValueError:
+                    rank = None
+            grouped.setdefault(t, []).append((rank if rank is not None else 9999, ch))
+
+        if not grouped:
+            return []
+
+        out: list[dict] = []
+        for t in sorted(grouped.keys()):
+            seen: set[str] = set()
+            channels: list[str] = []
+            for _rank, ch in sorted(grouped[t], key=lambda pair: pair[0]):
+                key = ch.upper()
+                if key in seen:
+                    continue
+                seen.add(key)
+                channels.append(ch)
+            out.append({"time_sec": t, "channels": channels})
+        return out
+
+    def _flatten_spike_events_for_legacy(self) -> list[dict]:
+        flat: list[dict] = []
+        for ev in self.spike_events:
+            t = float(ev["time_sec"])
+            for rank, ch in enumerate(ev.get("channels") or [], start=1):
+                flat.append({
+                    "channel": ch,
+                    "label": f"rank_{rank}",
+                    "time_sec": t,
+                    "rank": rank,
+                })
+        return flat
+
     def _is_contact_marked(self, contact: str) -> bool:
+        if self._clips_spike_workflow_enabled():
+            return self._contact_in_active_spike(contact)
         for ann in self.channel_annotations:
             ch = ann.get("channel") or ""
             if self._ten20_contact_equivalent(str(ch), contact):
@@ -3808,7 +4105,10 @@ class SeizureAnnotationGUI(QMainWindow):
         self.channel_annotations = unique
 
     def _on_montage_1020_contact_clicked(self, contact: str):
-        self._toggle_contact_annotation(contact)
+        if self._clips_spike_workflow_enabled():
+            self._add_channel_to_active_spike(contact)
+        else:
+            self._toggle_contact_annotation(contact)
 
     def _row_has_marked_contact(self, row_name: str) -> bool:
         return any(self._is_contact_marked(c) for c in self._contacts_from_row_name(row_name))
@@ -3843,6 +4143,11 @@ class SeizureAnnotationGUI(QMainWindow):
         ]
 
     def _all_contacts_from_annotations(self) -> set[str]:
+        if self._clips_spike_workflow_enabled():
+            ev = self._active_spike_event()
+            if ev is None:
+                return set()
+            return set(ev.get("channels") or [])
         out: set[str] = set()
         for ann in self.channel_annotations:
             out |= self._contacts_for_annotation_highlight(ann)
@@ -3891,6 +4196,7 @@ class SeizureAnnotationGUI(QMainWindow):
         self.plot.clear()
         self.trace_items = []
         self.annotation_markers = []
+        self._clips_spike_marker_items = []
         self.ictal_region = None
 
         if self.eeg_data is None or not self.displayed_channels:
@@ -4031,6 +4337,7 @@ class SeizureAnnotationGUI(QMainWindow):
     def _redraw_annotation_markers(self):
         """Draw markers / shaded regions and text labels for annotations."""
         if self.clips_mode:
+            self._redraw_clips_spike_markers()
             return
         for item in self.annotation_markers:
             self.plot.removeItem(item)
@@ -4087,6 +4394,69 @@ class SeizureAnnotationGUI(QMainWindow):
                 text_item.setPos(label_x, label_y)
                 self.plot.addItem(text_item)
                 self.annotation_markers.append(text_item)
+
+    def _refresh_clips_spike_markers(self) -> None:
+        """Redraw spike-time markers only (no trace clear → gain/scroll stay put)."""
+        if not self.clips_mode or self.eeg_data is None:
+            return
+        old_items = list(self._clips_spike_marker_items)
+        for item in old_items:
+            try:
+                self.plot.removeItem(item)
+            except Exception:
+                pass
+        self._clips_spike_marker_items = []
+        self.annotation_markers = [
+            m for m in self.annotation_markers if m not in old_items
+        ]
+        self._paint_clips_spike_markers()
+
+    def _paint_clips_spike_markers(self) -> None:
+        if not self._clips_spike_workflow_enabled():
+            return
+
+        t_view_start = self.time_offset_sec + self.scroll_pos
+        t_view_end = t_view_start + VISIBLE_SECONDS
+        y_range = self.plot.vb.viewRange()[1]
+        y_top = y_range[1]
+
+        for i, ev in enumerate(self.spike_events):
+            t = float(ev["time_sec"])
+            if t < t_view_start or t > t_view_end:
+                continue
+            active = i == self._active_spike_event_idx
+            color = CLIPS_ACTIVE_SPIKE_LINE_COLOR if active else CLIPS_USER_SPIKE_LINE_COLOR
+            width = 2.5 if active else 1.5
+            line = pg.InfiniteLine(
+                pos=t,
+                angle=90,
+                pen=pg.mkPen(color=color, width=width),
+                movable=False,
+            )
+            line.setZValue(20)
+            line._spike_event_idx = i
+            self.plot.addItem(line)
+            self._clips_spike_marker_items.append(line)
+            self.annotation_markers.append(line)
+
+            n_ch = len(ev.get("channels") or [])
+            label = f"Spike {i + 1} ({n_ch} ch)" if n_ch else f"Spike {i + 1}"
+            text_item = pg.TextItem(
+                text=label,
+                color=color,
+                anchor=(0.5, 1),
+            )
+            text_item.setFont(QFont("Sans", 8, QFont.Bold if active else QFont.Normal))
+            text_item.setPos(t, y_top)
+            text_item._spike_event_idx = i
+            self.plot.addItem(text_item)
+            self._clips_spike_marker_items.append(text_item)
+            self.annotation_markers.append(text_item)
+
+    def _redraw_clips_spike_markers(self) -> None:
+        """Called from full trace redraw after plot.clear()."""
+        self._clips_spike_marker_items = []
+        self._paint_clips_spike_markers()
 
     def _update_view(self):
         """Efficiently update only the x/y range and trace data without full redraw."""
@@ -4149,8 +4519,21 @@ class SeizureAnnotationGUI(QMainWindow):
         etype = event.type()
         if etype == QEvent.GraphicsSceneMousePress and event.button() == Qt.LeftButton:
             self._on_mouse_press(event)
+            if (
+                self.clips_mode
+                and self._clips_spike_workflow_enabled()
+                and self._drag_start_data is not None
+            ):
+                return True
         elif etype == QEvent.GraphicsSceneMouseRelease and event.button() == Qt.LeftButton:
+            consume = (
+                self.clips_mode
+                and self._clips_spike_workflow_enabled()
+                and self._drag_start_data is not None
+            )
             self._on_mouse_release(event)
+            if consume:
+                return True
         elif etype == QEvent.GraphicsSceneMouseDoubleClick and event.button() == Qt.LeftButton:
             if self.clips_mode:
                 return super().eventFilter(obj, event)
@@ -4220,7 +4603,18 @@ class SeizureAnnotationGUI(QMainWindow):
 
     def _on_mouse_press(self, event):
         """Record drag start position on left mouse press."""
-        if self.eeg_data is None or not self.displayed_channels:
+        if self.eeg_data is None:
+            return
+        if self.clips_mode and self._clips_spike_workflow_enabled():
+            vb = self.plot.vb
+            scene_pos = event.scenePos()
+            if not self.plot.vb.sceneBoundingRect().contains(scene_pos):
+                return
+            press_time = vb.mapSceneToView(scene_pos).x()
+            self._drag_start_data = (press_time,)
+            self._drag_channel_idx = None
+            return
+        if not self.displayed_channels:
             return
         result = self._scene_to_channel(event.scenePos())
         if result is None:
@@ -4309,9 +4703,6 @@ class SeizureAnnotationGUI(QMainWindow):
         self._drag_start_data = None
         self._drag_channel_idx = None
 
-        if start_ch_idx is None:
-            return
-
         scene_pos = event.scenePos()
         if not self.plot.sceneBoundingRect().contains(scene_pos):
             return
@@ -4319,6 +4710,13 @@ class SeizureAnnotationGUI(QMainWindow):
         release_time = data_pos.x()
 
         if abs(release_time - start_time) > 0.2:
+            return
+
+        if self.clips_mode and self._clips_spike_workflow_enabled():
+            self._on_clips_plot_click(release_time, scene_pos)
+            return
+
+        if start_ch_idx is None:
             return
 
         if self.clips_mode:
@@ -4412,13 +4810,51 @@ class SeizureAnnotationGUI(QMainWindow):
 
     def _refresh_annotation_list(self):
         self.annot_list.clear()
+        self._annot_list_meta = []
+
+        if self._has_no_spike_annotation():
+            self.annot_list.addItem("(clip): no_spike")
+            return
+
+        if self._clips_spike_workflow_enabled():
+            if not self.spike_events:
+                self.annot_list.addItem("(no spikes yet — click anywhere on plot)")
+                return
+            for si, ev in enumerate(self.spike_events):
+                t = float(ev["time_sec"])
+                active = si == self._active_spike_event_idx
+                item = QListWidgetItem(f"Spike @ {t:.3f} s")
+                if active:
+                    item.setForeground(QBrush(QColor(120, 0, 160)))
+                self.annot_list.addItem(item)
+                self._annot_list_meta.append(("spike", si, None))
+                for ci, ch in enumerate(ev.get("channels") or []):
+                    rank_item = QListWidgetItem(f"      #{ci + 1}  {ch}")
+                    self.annot_list.addItem(rank_item)
+                    self._annot_list_meta.append(("channel", si, ci))
+            return
+
         for ann in self.channel_annotations:
             types_text = ann.get("label") or self._format_types(ann.get("types"))
             label = f"{ann['channel']}: {types_text}"
             self.annot_list.addItem(label)
 
+    def _on_annotation_list_clicked(self, item: QListWidgetItem) -> None:
+        if not self._clips_spike_workflow_enabled():
+            return
+        row = self.annot_list.row(item)
+        if not (0 <= row < len(self._annot_list_meta)):
+            return
+        kind, spike_idx, channel_idx = self._annot_list_meta[row]
+        if kind == "spike" and spike_idx is not None:
+            self._remove_spike_event(spike_idx)
+        elif kind == "channel" and spike_idx is not None and channel_idx is not None:
+            self._remove_channel_from_spike_event(spike_idx, channel_idx)
+
     def _remove_channel_annotation(self, item: QListWidgetItem):
         row = self.annot_list.row(item)
+        if self._clips_spike_workflow_enabled():
+            return
         if 0 <= row < len(self.channel_annotations):
             self.channel_annotations.pop(row)
             self._refresh_annotation_list()
@@ -4551,10 +4987,20 @@ class SeizureAnnotationGUI(QMainWindow):
         global_types_out = None
 
         clean_channel_annotations = []
-        for ann in self.channel_annotations:
-            clean_channel_annotations.append({
-                "channel": ann.get("channel"),
-                "label": ann.get("label", "marked"),
+        if self._clips_spike_workflow_enabled():
+            clean_channel_annotations = self._flatten_spike_events_for_legacy()
+        else:
+            for ann in self.channel_annotations:
+                clean_channel_annotations.append({
+                    "channel": ann.get("channel"),
+                    "label": ann.get("label", "marked"),
+                })
+
+        clean_spike_events = []
+        for ev in self.spike_events:
+            clean_spike_events.append({
+                "time_sec": float(ev["time_sec"]),
+                "channels": list(ev.get("channels") or []),
             })
 
         opt = self._current_clip_option()
@@ -4571,6 +5017,8 @@ class SeizureAnnotationGUI(QMainWindow):
                 opt.get("display_id") if opt else self.current_recording
             ),
             "global_types": global_types_out,
+            "spike_events": clean_spike_events,
+            "active_spike_event_idx": self._active_spike_event_idx,
             "channel_annotations": clean_channel_annotations,
             "soz_channels": sorted(self.soz_channels),
             "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -4675,6 +5123,46 @@ class SeizureAnnotationGUI(QMainWindow):
 
             self.channel_annotations = payload.get("channel_annotations", [])
             self._normalize_channel_annotations()
+
+            raw_spike_events = payload.get("spike_events")
+            if isinstance(raw_spike_events, list) and raw_spike_events:
+                self.spike_events = []
+                for ev in raw_spike_events:
+                    if not isinstance(ev, dict):
+                        continue
+                    t_raw = ev.get("time_sec")
+                    if t_raw is None:
+                        continue
+                    channels = [
+                        str(ch).strip()
+                        for ch in (ev.get("channels") or [])
+                        if str(ch).strip()
+                    ]
+                    self.spike_events.append({
+                        "time_sec": float(t_raw),
+                        "channels": channels,
+                    })
+                active_raw = payload.get("active_spike_event_idx")
+                if (
+                    isinstance(active_raw, int)
+                    and 0 <= active_raw < len(self.spike_events)
+                ):
+                    self._active_spike_event_idx = active_raw
+                elif self.spike_events:
+                    self._active_spike_event_idx = 0
+                else:
+                    self._active_spike_event_idx = None
+            elif self.clips_mode and not self._has_no_spike_annotation():
+                self.spike_events = self._spike_events_from_legacy_annotations(
+                    self.channel_annotations
+                )
+                self._active_spike_event_idx = 0 if self.spike_events else None
+                if self.spike_events:
+                    self.channel_annotations = []
+            else:
+                self.spike_events = []
+                self._active_spike_event_idx = None
+
             if self.clips_mode and self.global_types.get("custom_type", "") == "no_spike":
                 if not self._has_no_spike_annotation():
                     self.channel_annotations.append({
@@ -4682,6 +5170,10 @@ class SeizureAnnotationGUI(QMainWindow):
                         "label": "no_spike",
                     })
                 self.global_types["custom_type"] = ""
+
+            if self.clips_mode and self._has_no_spike_annotation():
+                self.spike_events = []
+                self._active_spike_event_idx = None
 
             saved_soz = payload.get("soz_channels")
             if saved_soz is not None and self.channel_names_all:
